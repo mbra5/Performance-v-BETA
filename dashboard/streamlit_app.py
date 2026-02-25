@@ -195,7 +195,7 @@ if st.session_state.pending_index_sel is not None:
 # ── Controls ─────────────────────────────────────────────────────────────────
 col_tick, col_idx, col_per, col_btn, col_copy, col_spacer = st.columns([2, 1.5, 1.5, 1, 1, 3])
 with col_tick:
-    raw = st.text_input("Ticker", value="CRH", label_visibility="visible").upper().strip()
+    raw = st.text_input("Ticker", value="AAPL", label_visibility="visible").upper().strip()
 
 # Clear override when user types a new raw input
 if raw != st.session_state.last_raw:
