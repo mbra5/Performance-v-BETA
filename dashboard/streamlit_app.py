@@ -643,25 +643,26 @@ if ticker:
     )
 
     # ── Crosshair sync + snap-to-point drag measure ───────────────────────────
-    # Snap to nearest actual data points, draw two dashed vertical lines,
-    # show centered annotation with delta + date range.
+    # Tooltip uses a fixed-position DOM div (reliable across iframes).
+    # P.relayout is used only for the two dashed vertical lines (shapes).
+    # 'blocking' WeakSet prevents plotly_deselect from clearing immediately
+    # after plotly_selected fires and calls relayout (race condition).
     st.components.v1.html("""<script>
 (function(){
   var attached   = new WeakSet();
-  var origShapes = new WeakMap();   // preserve add_hline shapes per chart
+  var origShapes = new WeakMap();
+  var tipMap     = new WeakMap();   // chart → fixed-position tooltip div
+  var blocking   = new WeakSet();   // suppress clearDelta during relayout
 
   /* ── helpers ── */
   function toDateStr(v){
     if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
     return String(v).substring(0,10);
   }
-
   function fmtDate(s){
-    // "2024-03-15" → "Mar 15, 2024"
     var d=new Date(s+'T00:00:00');
     return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
   }
-
   function getMainTrace(chart){
     for(var i=0;i<chart.data.length;i++){
       var t=chart.data[i];
@@ -672,14 +673,10 @@ if ticker:
     }
     return null;
   }
-
   function isPriceChart(chart){
     try{ return (chart.layout.title.text||'').includes('Price Chart'); }
     catch(e){ return false; }
   }
-
-  /* Snap: find the nearest data-point index to a date string boundary.
-     Returns {x: dateStr, y: value} or null. */
   function snapNearest(tr, targetDate){
     var best=null, bestDiff=Infinity;
     var td=new Date(targetDate).getTime();
@@ -693,43 +690,77 @@ if ticker:
     return best;
   }
 
+  /* ── DOM tooltip (appended to parent body, fixed-position) ── */
+  function getTip(src){
+    if(tipMap.has(src)) return tipMap.get(src);
+    var d=window.parent.document.createElement('div');
+    d.style.cssText=[
+      'position:fixed','z-index:99999','pointer-events:none','display:none',
+      'padding:6px 12px','border-radius:6px',
+      'font:bold 12px/1.5 Inter,sans-serif',
+      'white-space:nowrap','color:#fff',
+      'box-shadow:0 2px 10px rgba(0,0,0,.45)'
+    ].join(';');
+    window.parent.document.body.appendChild(d);
+    tipMap.set(src,d);
+    return d;
+  }
+  function showTip(src,html,color){
+    var tip=getTip(src);
+    tip.style.background=color;
+    tip.innerHTML=html;
+    tip.style.display='block';
+    try{
+      var sr=src.getBoundingClientRect();          // coords in child iframe
+      var fr=window.frameElement.getBoundingClientRect(); // iframe in parent
+      tip.style.left =(fr.left+sr.left+sr.width/2)+'px';
+      tip.style.top  =(fr.top +sr.top +12)+'px';
+      tip.style.transform='translateX(-50%)';
+    }catch(e){}
+  }
+  function hideTip(src){
+    if(tipMap.has(src)) tipMap.get(src).style.display='none';
+  }
+
   function clearDelta(P, src){
-    var base = origShapes.get(src) || [];
-    try{ P.relayout(src, {'shapes': base, 'annotations': []}); }catch(e){}
+    if(blocking.has(src)) return;
+    hideTip(src);
+    var base=origShapes.get(src)||[];
+    try{ P.relayout(src,{'shapes':base}); }catch(e){}
   }
 
   function setup(){
-    var P = window.parent.Plotly;
+    var P=window.parent.Plotly;
     if(!P) return;
-    var charts = [...window.parent.document.querySelectorAll('.js-plotly-plot')];
+    var charts=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
     charts.forEach(function(src){
       if(attached.has(src)) return;
       attached.add(src);
 
-      /* snapshot original shapes (e.g. add_hline zero-line) */
+      /* snapshot original shapes */
       try{
-        var sh = (src.layout&&src.layout.shapes) ? src.layout.shapes.slice() : [];
-        origShapes.set(src, sh);
+        var sh=(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[];
+        origShapes.set(src,sh);
       }catch(e){ origShapes.set(src,[]); }
 
       /* ── crosshair sync ── */
-      src.on('plotly_hover', function(d){
+      src.on('plotly_hover',function(d){
         if(!d.points||!d.points[0]) return;
-        var xv = d.points[0].x;
-        var all = [...window.parent.document.querySelectorAll('.js-plotly-plot')];
+        var xv=d.points[0].x;
+        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
         all.forEach(function(dst){
           if(dst!==src) try{ P.Fx.hover(dst,[{xval:xv}],''); }catch(e){}
         });
       });
-      src.on('plotly_unhover', function(){
-        var all = [...window.parent.document.querySelectorAll('.js-plotly-plot')];
+      src.on('plotly_unhover',function(){
+        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
         all.forEach(function(dst){
           if(dst!==src) try{ P.Fx.hover(dst,[],''); }catch(e){}
         });
       });
 
       /* ── snap-to-point drag measure ── */
-      src.on('plotly_selected', function(ed){
+      src.on('plotly_selected',function(ed){
         if(!ed||!ed.range||!ed.range.x){ clearDelta(P,src); return; }
         var x0=toDateStr(ed.range.x[0]);
         var x1=toDateStr(ed.range.x[1]);
@@ -741,66 +772,44 @@ if ticker:
         var p0=snapNearest(tr,x0);
         var p1=snapNearest(tr,x1);
         if(!p0||!p1||p0.x===p1.x){ clearDelta(P,src); return; }
-
-        /* ensure p0 is the earlier date */
         if(new Date(p0.x)>new Date(p1.x)){ var tmp=p0; p0=p1; p1=tmp; }
 
-        var sy=p0.y, ey=p1.y;
-        var txt, color, arrow;
-
+        var sy=p0.y, ey=p1.y, txt, color, arrow;
         if(isPriceChart(src)){
           var dp=ey-sy, pct=((ey/sy)-1)*100;
-          arrow = dp>=0 ? '▲' : '▼';
-          color = dp>=0 ? '#10b981' : '#ef4444';
-          var sign = dp>=0?'+':'-';
-          txt = '<b>'+sign+'$'+Math.abs(dp).toFixed(2)
-              +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '
-              +arrow+'</b><br><span style="font-size:10px;opacity:0.85">'
-              +fmtDate(p0.x)+' – '+fmtDate(p1.x)+'</span>';
+          arrow=dp>=0?'▲':'▼'; color=dp>=0?'#10b981':'#ef4444';
+          txt='<b>'+(dp>=0?'+':'-')+'$'+Math.abs(dp).toFixed(2)
+             +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '+arrow+'</b>'
+             +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
+             +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
         } else {
           var dpp=(ey-sy)*100;
-          arrow = dpp>=0 ? '▲' : '▼';
-          color = dpp>=0 ? '#10b981' : '#ef4444';
-          var sign = dpp>=0?'+':'';
-          txt = '<b>'+(sign+dpp.toFixed(1))+' pp '+arrow+'</b>'
-              +'<br><span style="font-size:10px;opacity:0.85">'
-              +fmtDate(p0.x)+' – '+fmtDate(p1.x)+'</span>';
+          arrow=dpp>=0?'▲':'▼'; color=dpp>=0?'#10b981':'#ef4444';
+          txt='<b>'+(dpp>=0?'+':'')+dpp.toFixed(1)+' pp '+arrow+'</b>'
+             +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
+             +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
         }
 
-        /* two dashed vertical lines at snap points */
-        var vline = function(xval){ return {
-          type:'line', xref:'x', yref:'paper',
-          x0:xval, x1:xval, y0:0, y1:1,
-          line:{color:'rgba(180,180,200,0.7)', width:1.5, dash:'dot'},
+        /* two dashed vertical lines via relayout shapes */
+        var vline=function(xv){ return {
+          type:'line',xref:'x',yref:'paper',
+          x0:xv,x1:xv,y0:0,y1:1,
+          line:{color:'rgba(180,180,200,.7)',width:1.5,dash:'dot'},
           layer:'above'
-        }; };
+        };};
+        var base=origShapes.get(src)||[];
 
-        var base = origShapes.get(src) || [];
-        try{
-          P.relayout(src, {
-            'shapes': base.concat([vline(p0.x), vline(p1.x)]),
-            'annotations': [{
-              /* centered between the two snap lines in data coords */
-              xref: 'x',
-              x: new Date((new Date(p0.x).getTime()+new Date(p1.x).getTime())/2)
-                    .toISOString().substring(0,10),
-              y: 0.96, yref: 'paper',
-              text: txt,
-              showarrow: false,
-              font: {color:'#ffffff', size:12, family:'Inter, sans-serif'},
-              bgcolor: color,
-              borderpad: 6, borderwidth: 0,
-              xanchor: 'center', yanchor: 'top',
-              opacity: 0.93
-            }]
-          });
-        }catch(e){}
+        /* block clearDelta during relayout to avoid race with plotly_deselect */
+        blocking.add(src);
+        try{ P.relayout(src,{'shapes':base.concat([vline(p0.x),vline(p1.x)])}); }catch(e){}
+        showTip(src,txt,color);
+        setTimeout(function(){ blocking.delete(src); },400);
       });
 
-      src.on('plotly_deselect', function(){ clearDelta(P,src); });
+      src.on('plotly_deselect',function(){ clearDelta(P,src); });
     });
   }
 
-  setInterval(setup, 800);
+  setInterval(setup,800);
 })();
 </script>""", height=0)
