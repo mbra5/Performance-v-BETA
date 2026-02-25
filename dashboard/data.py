@@ -9,6 +9,7 @@ Logic mirrors the Excel model:
   Computed for three windows: 2W (10 days), 4W (20 days), 12W (60 days)
 """
 
+import re
 import warnings
 import numpy as np
 import pandas as pd
@@ -16,11 +17,99 @@ import yfinance as yf
 
 # Map index display names to yfinance tickers
 INDEX_MAP = {
-    "SPX":  "^GSPC",
-    "NDX":  "^NDX",
-    "RTY":  "^RUT",
-    "DJIA": "^DJI",
+    "SPX":   "^GSPC",
+    "NDX":   "^NDX",
+    "RTY":   "^RUT",
+    "DJIA":  "^DJI",
+    "TWSE":  "^TWII",    # Taiwan Weighted Index
+    "NKY":   "^N225",    # Nikkei 225
+    "FTSE":  "^FTSE",    # FTSE 100
+    "DAX":   "^GDAXI",   # German DAX
+    "CAC":   "^FCHI",    # CAC 40
+    "HSI":   "^HSI",     # Hang Seng
+    "KOSPI": "^KS11",    # Korea KOSPI
+    "ASX200":"^AXJO",    # Australia ASX 200
 }
+
+# Bloomberg exchange suffix → (yfinance suffix, home index key)
+BLOOMBERG_EXCHANGE_MAP = {
+    "TT": (".TW",  "TWSE"),    # Taiwan
+    "JT": (".T",   "NKY"),     # Japan (Tokyo)
+    "LN": (".L",   "FTSE"),    # UK London
+    "FP": (".PA",  "CAC"),     # France Paris
+    "GY": (".DE",  "DAX"),     # Germany Xetra
+    "IM": (".MI",  "DAX"),     # Italy Milan
+    "NA": (".AS",  "DAX"),     # Netherlands Amsterdam
+    "SM": (".MC",  "DAX"),     # Spain Madrid
+    "HK": (".HK",  "HSI"),     # Hong Kong
+    "AU": (".AX",  "ASX200"),  # Australia
+    "KS": (".KS",  "KOSPI"),   # Korea KSE
+    "KP": (".KQ",  "KOSPI"),   # Korea KOSDAQ
+    "SP": (".SI",  "SPX"),     # Singapore
+}
+
+
+def normalize_ticker(raw: str) -> tuple[str, str | None, str | None]:
+    """
+    Normalize a Bloomberg-style ticker to yfinance format.
+
+    Handles:
+      "2330 TT"  → ("2330.TW", "TWSE", "TT")
+      "9984 JT"  → ("9984.T",  "NKY",  "JT")
+      "CRH LN"   → ("CRH.L",   "FTSE", "LN")
+      "CRH US"   → ("CRH",     "SPX",  "US")
+      "AAPL"     → ("AAPL",    None,   None)   ← no change
+
+    Returns (yfinance_ticker, suggested_index_key, detected_exchange_code).
+    """
+    raw = raw.strip().upper()
+    raw = re.sub(r"\s+EQUITY\s*$", "", raw)  # strip trailing " EQUITY"
+
+    parts = raw.split()
+    if len(parts) == 2:
+        base, exch = parts
+        if exch == "US":
+            return base, "SPX", "US"
+        if exch in BLOOMBERG_EXCHANGE_MAP:
+            suffix, idx = BLOOMBERG_EXCHANGE_MAP[exch]
+            return base + suffix, idx, exch
+
+    return raw.replace(" ", ""), None, None
+
+
+# yfinance exchange suffix → home index (for reverse-lookup after symbol selection)
+YFINANCE_SUFFIX_INDEX_MAP = {
+    "TW": "TWSE", "T":  "NKY",   "L":  "FTSE",
+    "PA": "CAC",  "DE": "DAX",   "MI": "DAX",
+    "AS": "DAX",  "MC": "DAX",   "HK": "HSI",
+    "AX": "ASX200", "KS": "KOSPI", "KQ": "KOSPI",
+}
+
+
+def search_ticker(query: str, max_results: int = 5) -> list[dict]:
+    """Search Yahoo Finance; returns list of {symbol, name, exchange}."""
+    try:
+        import requests
+        url = (
+            "https://query2.finance.yahoo.com/v1/finance/search"
+            f"?q={requests.utils.quote(query)}"
+            f"&quotesCount={max_results}&newsCount=0&listsCount=0"
+        )
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        data = resp.json()
+        out = []
+        for q in data.get("quotes", []):
+            if q.get("quoteType") not in ("EQUITY", "ETF"):
+                continue
+            out.append({
+                "symbol": q["symbol"],
+                "name": q.get("shortname") or q.get("longname") or q["symbol"],
+                "exchange": q.get("exchange", ""),
+            })
+        return out[:max_results]
+    except Exception:
+        return []
+
 
 WINDOWS = {
     "2W":  10,   # 2 calendar weeks ~ 10 trading days
@@ -77,13 +166,26 @@ def load_data(
         return pd.DataFrame(), f"No data found for index '{index_key}'."
 
     # Extract closing prices — handle MultiIndex columns from yfinance v0.2+
+    # and fallback to "Adj Close" for markets that label it differently.
     def extract_close(raw):
-        if isinstance(raw.columns, pd.MultiIndex):
-            return raw["Close"].iloc[:, 0]
-        return raw["Close"]
+        for col_name in ("Close", "Adj Close"):
+            if isinstance(raw.columns, pd.MultiIndex):
+                if col_name in raw.columns.get_level_values(0):
+                    s = raw[col_name]
+                    return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
+            elif col_name in raw.columns:
+                return raw[col_name]
+        raise ValueError(f"No close price column found; got: {list(raw.columns)[:5]}")
 
     stock_px = extract_close(raw_stock).rename("stock_price")
     index_px = extract_close(raw_index).rename("index_price")
+
+    # Strip timezone so both series share a tz-naive DatetimeIndex before concat.
+    # International equities (e.g. .KS, .T) often return KST/JST-aware data.
+    if isinstance(stock_px.index, pd.DatetimeIndex) and stock_px.index.tz is not None:
+        stock_px.index = stock_px.index.tz_localize(None)
+    if isinstance(index_px.index, pd.DatetimeIndex) and index_px.index.tz is not None:
+        index_px.index = index_px.index.tz_localize(None)
 
     # Align to common trading days
     df = pd.concat([stock_px, index_px], axis=1).dropna()

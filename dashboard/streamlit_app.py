@@ -13,7 +13,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 
-from data import load_data, get_company_name, INDEX_MAP
+from data import (load_data, get_company_name, INDEX_MAP,
+                  normalize_ticker, search_ticker, YFINANCE_SUFFIX_INDEX_MAP)
 
 # ── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -167,12 +168,73 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ── Search helper (cached 5 min) ─────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def _search(q: str):
+    return search_ticker(q)
+
+# ── Session state ─────────────────────────────────────────────────────────────
+if "index_sel" not in st.session_state:
+    st.session_state.index_sel = "SPX"
+if "last_exch" not in st.session_state:
+    st.session_state.last_exch = None
+if "ticker_override" not in st.session_state:
+    st.session_state.ticker_override = None
+if "last_raw" not in st.session_state:
+    st.session_state.last_raw = ""
+if "pending_index_sel" not in st.session_state:
+    st.session_state.pending_index_sel = None
+if "suggested_index" not in st.session_state:
+    st.session_state.suggested_index = None
+
+# Apply any pending index switch BEFORE widgets are instantiated
+if st.session_state.pending_index_sel is not None:
+    st.session_state.index_sel = st.session_state.pending_index_sel
+    st.session_state.pending_index_sel = None
+
 # ── Controls ─────────────────────────────────────────────────────────────────
 col_tick, col_idx, col_per, col_btn, col_copy, col_spacer = st.columns([2, 1.5, 1.5, 1, 1, 3])
 with col_tick:
-    ticker = st.text_input("Ticker", value="CRH", label_visibility="visible").upper().strip()
+    raw = st.text_input("Ticker", value="CRH", label_visibility="visible").upper().strip()
+
+# Clear override when user types a new raw input
+if raw != st.session_state.last_raw:
+    st.session_state.ticker_override = None
+    st.session_state.last_raw = raw
+
+# Determine effective ticker and auto-switch index
+if st.session_state.ticker_override:
+    ticker    = st.session_state.ticker_override
+    exch_code = None
+    # Auto-detect index from yfinance suffix (e.g. "006400.KS" → KOSPI)
+    if "." in ticker:
+        suf = ticker.rsplit(".", 1)[-1]
+        if suf in YFINANCE_SUFFIX_INDEX_MAP and suf != st.session_state.last_exch:
+            st.session_state.index_sel      = YFINANCE_SUFFIX_INDEX_MAP[suf]
+            st.session_state.suggested_index = YFINANCE_SUFFIX_INDEX_MAP[suf]
+            st.session_state.last_exch      = suf
+else:
+    ticker, suggested_idx, exch_code = normalize_ticker(raw)
+    if exch_code != st.session_state.last_exch:
+        if suggested_idx:
+            st.session_state.index_sel       = suggested_idx
+            st.session_state.suggested_index = suggested_idx
+        elif exch_code is None:
+            st.session_state.index_sel       = "SPX"
+            st.session_state.suggested_index = None
+        st.session_state.last_exch = exch_code
+
+if ticker != raw and raw:
+    col_tick.caption(f"→ {ticker}")
+
+def _fmt_idx(k):
+    if k == st.session_state.suggested_index:
+        return f"{k} (suggested)"
+    return k
+
 with col_idx:
-    index_key = st.selectbox("vs. Index", list(INDEX_MAP.keys()), index=0)
+    index_key = st.selectbox("vs. Index", list(INDEX_MAP.keys()), key="index_sel",
+                              format_func=_fmt_idx)
 with col_per:
     period = st.selectbox("Period", ["1y", "2y", "3y", "5y"], index=2)
 with col_btn:
@@ -224,6 +286,25 @@ async function run(){
 </script>
 """, height=38)
 
+# ── Ticker search suggestions ─────────────────────────────────────────────────
+if raw and len(raw) >= 2 and not st.session_state.ticker_override and exch_code is None:
+    results  = _search(raw)
+    to_show  = [r for r in results if r["symbol"].upper() != raw.upper()][:5]
+    if to_show:
+        n      = len(to_show)
+        s_cols = st.columns([1.7] * n + [max(0.1, 10 - 1.7 * n)])
+        for i, r in enumerate(to_show):
+            with s_cols[i]:
+                label = f"{r['symbol']} — {r['name'][:22]}"
+                if st.button(label, key=f"sug_{r['symbol']}", use_container_width=True):
+                    suf = r["symbol"].rsplit(".", 1)[-1] if "." in r["symbol"] else None
+                    if suf and suf in YFINANCE_SUFFIX_INDEX_MAP:
+                        st.session_state.pending_index_sel = YFINANCE_SUFFIX_INDEX_MAP[suf]
+                        st.session_state.suggested_index   = YFINANCE_SUFFIX_INDEX_MAP[suf]
+                        st.session_state.last_exch         = suf
+                    st.session_state.ticker_override = r["symbol"]
+                    st.rerun()
+
 st.divider()
 
 # ── Load & render ─────────────────────────────────────────────────────────────
@@ -254,9 +335,11 @@ if ticker:
 
     # ── Company name + date range ─────────────────────────────────────────────
     name_display = company_name if company_name != ticker else ticker
+    _index_label = (f"{index_key} (suggested)"
+                    if index_key == st.session_state.get("suggested_index") else index_key)
     st.markdown(
         f'<p class="company-name">{name_display}</p>'
-        f'<p class="ticker-sub">{ticker} &nbsp;·&nbsp; {index_key} &nbsp;·&nbsp; '
+        f'<p class="ticker-sub">{ticker} &nbsp;·&nbsp; {_index_label} &nbsp;·&nbsp; '
         f'{df_plot["date"].iloc[0].strftime("%m/%d/%y")} – {df_plot["date"].iloc[-1].strftime("%m/%d/%y")}'
         f'</p>',
         unsafe_allow_html=True,
