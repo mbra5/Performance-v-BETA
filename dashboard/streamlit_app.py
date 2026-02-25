@@ -221,7 +221,7 @@ else:
             st.session_state.suggested_index = suggested_idx
         elif exch_code is None:
             st.session_state.index_sel       = "SPX"
-            st.session_state.suggested_index = None
+            st.session_state.suggested_index = "SPX"
         st.session_state.last_exch = exch_code
 
 if ticker != raw and raw:
