@@ -635,8 +635,7 @@ if ticker:
     st.markdown(
         '<p class="source-note">'
         'Data: Yahoo Finance via yfinance &nbsp;·&nbsp; '
-        'Beta window: 126 trading days (~6 months) &nbsp;·&nbsp; '
-        'Drag on any chart to measure change between two dates'
+        'Beta window: 126 trading days (~6 months)'
         '</p>',
         unsafe_allow_html=True,
     )
@@ -727,12 +726,12 @@ if ticker:
         var sy=null, ey=null;
         for(var j=0;j<tr.x.length;j++){
           var xd = toDateStr(tr.x[j]);
-          var yv = tr.y[j];
-          if(yv===null||yv!==yv) continue;    /* skip null/NaN */
+          var yv = parseFloat(tr.y[j]);       /* parseFloat turns null/undefined/NaN → NaN */
+          if(!Number.isFinite(yv)) continue;  /* skip any non-numeric value */
           if(sy===null && xd>=x0) sy=yv;
           if(xd<=x1) ey=yv;
         }
-        if(sy===null||ey===null){ div.style.display='none'; return; }
+        if(!Number.isFinite(sy)||!Number.isFinite(ey)){ div.style.display='none'; return; }
 
         var txt, color;
         if(isPriceChart(src)){
