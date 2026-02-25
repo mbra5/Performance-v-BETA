@@ -641,31 +641,15 @@ if ticker:
     )
 
     # ── Crosshair sync + drag-to-delta ────────────────────────────────────────
+    # Delta label uses Plotly.relayout annotations (top-right of chart) to
+    # avoid cross-iframe DOM issues with dynamically appended divs.
     st.components.v1.html("""<script>
 (function(){
   var attached = new WeakSet();
-  var deltaMap = new WeakMap();
 
   function toDateStr(v){
     if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
     return String(v).substring(0,10);
-  }
-
-  function getDeltaDiv(chart){
-    if(deltaMap.has(chart)) return deltaMap.get(chart);
-    var wrap = chart.closest('[data-testid="stPlotlyChart"]');
-    if(!wrap) return null;
-    wrap.style.position = 'relative';
-    var d = window.parent.document.createElement('div');
-    d.style.cssText =
-      'position:absolute;top:8px;left:50%;transform:translateX(-50%);'
-      +'background:rgba(255,255,255,0.96);border-radius:6px;border:1.5px solid #e2e8f0;'
-      +'padding:3px 10px;font-size:12px;font-weight:700;font-family:Inter,sans-serif;'
-      +'pointer-events:none;z-index:9999;display:none;white-space:nowrap;'
-      +'box-shadow:0 2px 8px rgba(0,0,0,0.1);';
-    wrap.appendChild(d);
-    deltaMap.set(chart, d);
-    return d;
   }
 
   function getMainTrace(chart){
@@ -673,7 +657,7 @@ if ticker:
       var t=chart.data[i];
       if(!t.x||t.x.length<=1) continue;
       if(t.mode==='markers') continue;
-      if(t.line&&t.line.width===0) continue;
+      if(t.line&&Number(t.line.width)===0) continue;
       return t;
     }
     return null;
@@ -682,6 +666,10 @@ if ticker:
   function isPriceChart(chart){
     try{ return (chart.layout.title.text||'').includes('Price Chart'); }
     catch(e){ return false; }
+  }
+
+  function clearDelta(P, src){
+    try{ P.relayout(src, {'annotations': []}); }catch(e){}
   }
 
   function setup(){
@@ -708,51 +696,50 @@ if ticker:
         });
       });
 
-      /* ── drag-to-delta ── */
+      /* ── drag-to-delta (Plotly annotation overlay) ── */
       src.on('plotly_selected', function(ed){
-        var div = getDeltaDiv(src);
-        if(!div) return;
-        if(!ed||!ed.range||!ed.range.x){ div.style.display='none'; return; }
+        if(!ed||!ed.range||!ed.range.x){ clearDelta(P,src); return; }
+        var x0=toDateStr(ed.range.x[0]);
+        var x1=toDateStr(ed.range.x[1]);
+        if(new Date(x1)-new Date(x0)<86400000){ clearDelta(P,src); return; }
 
-        var x0 = toDateStr(ed.range.x[0]);
-        var x1 = toDateStr(ed.range.x[1]);
-
-        /* require at least 1 day of selection */
-        if(new Date(x1) - new Date(x0) < 86400000){ div.style.display='none'; return; }
-
-        var tr = getMainTrace(src);
-        if(!tr){ div.style.display='none'; return; }
+        var tr=getMainTrace(src);
+        if(!tr){ clearDelta(P,src); return; }
 
         var sy=null, ey=null;
         for(var j=0;j<tr.x.length;j++){
-          var xd = toDateStr(tr.x[j]);
-          var yv = parseFloat(tr.y[j]);       /* parseFloat turns null/undefined/NaN → NaN */
-          if(!Number.isFinite(yv)) continue;  /* skip any non-numeric value */
-          if(sy===null && xd>=x0) sy=yv;
+          var xd=toDateStr(tr.x[j]);
+          var yv=parseFloat(tr.y[j]);
+          if(!Number.isFinite(yv)) continue;
+          if(sy===null&&xd>=x0) sy=yv;
           if(xd<=x1) ey=yv;
         }
-        if(!Number.isFinite(sy)||!Number.isFinite(ey)){ div.style.display='none'; return; }
+        if(!Number.isFinite(sy)||!Number.isFinite(ey)){ clearDelta(P,src); return; }
 
         var txt, color;
         if(isPriceChart(src)){
-          var dp=ey-sy, pct=((ey/sy)-1)*100, s=dp>=0?'+':'-';
-          txt = s+'$'+Math.abs(dp).toFixed(2)+' ('+( dp>=0?'+':'' )+pct.toFixed(1)+'%)';
-          color = dp>=0 ? '#10b981' : '#ef4444';
+          var dp=ey-sy, pct=((ey/sy)-1)*100, sign=dp>=0?'+':'-';
+          txt=sign+'$'+Math.abs(dp).toFixed(2)+' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%)';
+          color=dp>=0?'#10b981':'#ef4444';
         } else {
-          var dpp=(ey-sy)*100, s=dpp>=0?'+':'';
-          txt = s+dpp.toFixed(1)+' pp';
-          color = dpp>=0 ? '#10b981' : '#ef4444';
+          var dpp=(ey-sy)*100, sign=dpp>=0?'+':'';
+          txt=sign+dpp.toFixed(1)+' pp';
+          color=dpp>=0?'#10b981':'#ef4444';
         }
-        div.innerHTML = txt;
-        div.style.color = color;
-        div.style.borderColor = color;
-        div.style.display = 'block';
+        try{
+          P.relayout(src, {'annotations': [{
+            x:0.99, y:0.98, xref:'paper', yref:'paper',
+            text:'<b>'+txt+'</b>',
+            showarrow:false,
+            font:{color:'#ffffff', size:12, family:'Inter, sans-serif'},
+            bgcolor:color, borderpad:5, borderwidth:0,
+            xanchor:'right', yanchor:'top',
+            opacity:0.92
+          }]});
+        }catch(e){}
       });
 
-      src.on('plotly_deselect', function(){
-        var div = getDeltaDiv(src);
-        if(div) div.style.display='none';
-      });
+      src.on('plotly_deselect', function(){ clearDelta(P,src); });
     });
   }
 
