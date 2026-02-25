@@ -157,6 +157,36 @@ st.markdown("""
   ::-webkit-scrollbar { width: 5px; height: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+  /* ── Color-coded metric cards ── */
+  .color-metric {
+    background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
+    padding: 14px 18px; min-height: 78px;
+    display: flex; flex-direction: column; justify-content: center;
+    box-shadow: 0 1px 2px rgba(15,23,42,0.04); transition: box-shadow 0.2s;
+  }
+  .color-metric:hover { box-shadow: 0 4px 8px rgba(15,23,42,0.08); }
+  .cm-label {
+    color: #64748b; font-size: 10px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.07em;
+    font-family: 'Inter', sans-serif; margin-bottom: 4px;
+  }
+  .cm-value {
+    font-size: 20px; font-weight: 700; letter-spacing: -0.02em;
+    font-family: 'Inter', sans-serif;
+  }
+
+  /* ── Date range slider ── */
+  [data-testid="stSlider"] { padding: 2px 0 6px 0 !important; }
+  [data-testid="stSlider"] label { display: none !important; }
+
+  /* ── Mobile: single-column stack ── */
+  @media (max-width: 768px) {
+    [data-testid="column"] {
+      width: 100% !important; flex: 0 0 100% !important;
+      min-width: 100% !important;
+    }
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -168,10 +198,18 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Search helper (cached 5 min) ─────────────────────────────────────────────
+# ── Cached data helpers ───────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def _search(q: str):
     return search_ticker(q)
+
+@st.cache_data(ttl=3600)
+def _load(ticker, index_key, period):
+    return load_data(ticker, index_key=index_key, period=period)
+
+@st.cache_data(ttl=86400)
+def _company(ticker):
+    return get_company_name(ticker)
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if "index_sel" not in st.session_state:
@@ -309,9 +347,9 @@ st.divider()
 
 # ── Load & render ─────────────────────────────────────────────────────────────
 if ticker:
-    with st.spinner(f"Fetching {ticker}..."):
-        df, error    = load_data(ticker, index_key=index_key, period=period)
-        company_name = get_company_name(ticker)
+    with st.spinner(f"Loading {ticker}…"):
+        df, error    = _load(ticker, index_key, period)
+        company_name = _company(ticker)
 
     if error or df.empty:
         st.error(f"Could not load data for **{ticker}**: {error or 'empty response'}")
@@ -345,21 +383,48 @@ if ticker:
         unsafe_allow_html=True,
     )
 
-    # ── Metric cards ──────────────────────────────────────────────────────────
+    # ── Metric cards (color-coded) ────────────────────────────────────────────
     m1, m2, m3, m4, m5 = st.columns(5)
     latest = df.iloc[-1]
-    m1.metric("Price",            f"${latest.get('stock_price', 0):,.2f}")
-    m2.metric("Beta (6M)",        f"{latest.get('beta', 0):.2f}")
-    m3.metric("Perf vs Beta 2W",  f"{latest.get('perf_vs_beta_2W', 0)*100:+.1f}%")
-    m4.metric("Perf vs Beta 4W",  f"{latest.get('perf_vs_beta_4W', 0)*100:+.1f}%")
-    m5.metric("Perf vs Beta 12W", f"{latest.get('perf_vs_beta_12W', 0)*100:+.1f}%")
+    _G, _R, _N = "#10b981", "#ef4444", "#0f172a"
 
-    # ── X-axis range ──────────────────────────────────────────────────────────
-    x_end   = df_plot["date"].iloc[-1]
-    x_start = max(
-        df_plot["date"].iloc[0],
-        x_end - pd.Timedelta(days={"1y": 365, "2y": 730, "3y": 1095, "5y": 1825}[period]),
+    def _card(col, label, val_str, color=None):
+        col.markdown(
+            f'<div class="color-metric">'
+            f'<div class="cm-label">{label}</div>'
+            f'<div class="cm-value" style="color:{color or _N}">{val_str}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    def _pcolor(v):
+        return _G if v > 0 else (_R if v < 0 else _N)
+
+    pvb_2w  = latest.get("perf_vs_beta_2W",  0) or 0
+    pvb_4w  = latest.get("perf_vs_beta_4W",  0) or 0
+    pvb_12w = latest.get("perf_vs_beta_12W", 0) or 0
+
+    _card(m1, "Price",            f"${latest.get('stock_price', 0):,.2f}")
+    _card(m2, "Beta (6M)",        f"{latest.get('beta', 0):.2f}")
+    _card(m3, "Perf vs Beta 2W",  f"{pvb_2w*100:+.1f}%",  _pcolor(pvb_2w))
+    _card(m4, "Perf vs Beta 4W",  f"{pvb_4w*100:+.1f}%",  _pcolor(pvb_4w))
+    _card(m5, "Perf vs Beta 12W", f"{pvb_12w*100:+.1f}%", _pcolor(pvb_12w))
+
+    # ── Date range slider ─────────────────────────────────────────────────────
+    _min_d = df_plot["date"].iloc[0].date()
+    _max_d = df_plot["date"].iloc[-1].date()
+    _days  = {"1y": 365, "2y": 730, "3y": 1095, "5y": 1825}[period]
+    _def_s = max(_min_d, _max_d - pd.Timedelta(days=_days))
+    _rng   = st.slider(
+        "Date range",
+        min_value=_min_d, max_value=_max_d,
+        value=(_def_s, _max_d),
+        format="MM/DD/YY",
+        label_visibility="collapsed",
+        key=f"dr_{ticker}_{index_key}_{period}",
     )
+    x_start = pd.Timestamp(_rng[0])
+    x_end   = pd.Timestamp(_rng[1])
 
     # ── Shared axis / layout helpers ──────────────────────────────────────────
     # 1080p viewport (~940px) minus header+controls+divider+company+metrics+gaps ≈ 300px
@@ -371,6 +436,8 @@ if ticker:
         tickfont=dict(color=MUTED, size=9, family="Inter, sans-serif"),
         showgrid=True, linecolor=GRID, linewidth=1, showline=True,
         ticks="outside", tickcolor=GRID, ticklen=3,
+        showspikes=True, spikemode="across", spikesnap="cursor",
+        spikedash="solid", spikecolor="#94a3b8", spikethickness=1,
     )
 
     def _base_layout(title):
@@ -400,6 +467,13 @@ if ticker:
         fill="tozeroy", fillcolor="rgba(16,185,129,0.08)",
         hovertemplate="%{x|%b %d, %Y}<br><b>$%{y:,.2f}</b><extra></extra>",
     ))
+    fig_price.add_trace(go.Scatter(
+        x=[dates.iloc[-1]], y=[df_plot["stock_price"].iloc[-1]],
+        mode="markers",
+        marker=dict(color=GREEN, size=7, symbol="circle",
+                    line=dict(color="white", width=1.5)),
+        hoverinfo="skip",
+    ))
     fig_price.update_layout(**_base_layout(f"Price Chart — {name_display}"))
     fig_price.update_xaxes(range=[x_start, x_end], **_ax)
     fig_price.update_yaxes(tickformat="$,.2f", **_ax)
@@ -426,6 +500,22 @@ if ticker:
             hovertemplate="%{x|%b %d, %Y}<br><b>%{y:.2%}</b><extra></extra>",
         ))
         fig.add_hline(y=0, line_dash="solid", line_color=ZERO, line_width=1)
+        # Last data point dot
+        fig.add_trace(go.Scatter(
+            x=[dates.iloc[-1]], y=[y.iloc[-1]],
+            mode="markers",
+            marker=dict(color=color, size=7, symbol="circle",
+                        line=dict(color="white", width=1.5)),
+            hoverinfo="skip",
+        ))
+        # Zero-line label at right edge
+        fig.add_annotation(
+            x=1, y=0, text="0%", showarrow=False,
+            font=dict(color=MUTED, size=8, family="Inter, sans-serif"),
+            xanchor="right", yanchor="bottom",
+            xref="paper", yref="y",
+            bgcolor="rgba(255,255,255,0.75)", borderpad=2,
+        )
         fig.update_layout(**_base_layout(f"Perf vs. Beta — {label}  ({ticker} vs {index_key})"))
         fig.update_xaxes(range=[x_start, x_end], **_ax)
         fig.update_yaxes(tickformat=".1%", **_ax)
@@ -446,3 +536,34 @@ if ticker:
     with col_right:
         st.plotly_chart(fig_12w,  use_container_width=True)    # top-right
         st.plotly_chart(fig_2w,   use_container_width=True)    # bottom-right
+
+    # ── Crosshair sync across all 4 charts ───────────────────────────────────
+    st.components.v1.html("""<script>
+(function(){
+  var attached=new WeakSet();
+  function setup(){
+    var P=window.parent.Plotly;
+    if(!P)return;
+    var charts=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+    charts.forEach(function(src){
+      if(attached.has(src))return;
+      attached.add(src);
+      src.on('plotly_hover',function(d){
+        if(!d.points||!d.points[0])return;
+        var xv=d.points[0].x;
+        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+        all.forEach(function(dst){
+          if(dst!==src)try{P.Fx.hover(dst,[{xval:xv}],'');}catch(e){}
+        });
+      });
+      src.on('plotly_unhover',function(){
+        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+        all.forEach(function(dst){
+          if(dst!==src)try{P.Fx.hover(dst,[],'');}catch(e){}
+        });
+      });
+    });
+  }
+  setInterval(setup,800);
+})();
+</script>""", height=0)
