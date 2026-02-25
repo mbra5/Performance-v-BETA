@@ -11,6 +11,8 @@ Changes in this version:
   - Pre-caches S&P 500 / S&P 1000 / QQQ + all indices; daily 4:15 PM refresh
   - Data source note at bottom
   - Drag on any chart measures change (price $±% or pp) instead of zooming
+  - Snap-to-point drag: snaps to nearest data points, draws dashed vertical
+    lines, shows centered tooltip with delta + date range (Google Finance style)
 """
 
 import sys, os
@@ -640,16 +642,24 @@ if ticker:
         unsafe_allow_html=True,
     )
 
-    # ── Crosshair sync + drag-to-delta ────────────────────────────────────────
-    # Delta label uses Plotly.relayout annotations (top-right of chart) to
-    # avoid cross-iframe DOM issues with dynamically appended divs.
+    # ── Crosshair sync + snap-to-point drag measure ───────────────────────────
+    # Snap to nearest actual data points, draw two dashed vertical lines,
+    # show centered annotation with delta + date range.
     st.components.v1.html("""<script>
 (function(){
-  var attached = new WeakSet();
+  var attached   = new WeakSet();
+  var origShapes = new WeakMap();   // preserve add_hline shapes per chart
 
+  /* ── helpers ── */
   function toDateStr(v){
     if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
     return String(v).substring(0,10);
+  }
+
+  function fmtDate(s){
+    // "2024-03-15" → "Mar 15, 2024"
+    var d=new Date(s+'T00:00:00');
+    return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
   }
 
   function getMainTrace(chart){
@@ -668,8 +678,24 @@ if ticker:
     catch(e){ return false; }
   }
 
+  /* Snap: find the nearest data-point index to a date string boundary.
+     Returns {x: dateStr, y: value} or null. */
+  function snapNearest(tr, targetDate){
+    var best=null, bestDiff=Infinity;
+    var td=new Date(targetDate).getTime();
+    for(var j=0;j<tr.x.length;j++){
+      var yv=parseFloat(tr.y[j]);
+      if(!Number.isFinite(yv)) continue;
+      var xd=toDateStr(tr.x[j]);
+      var diff=Math.abs(new Date(xd).getTime()-td);
+      if(diff<bestDiff){ bestDiff=diff; best={x:xd,y:yv}; }
+    }
+    return best;
+  }
+
   function clearDelta(P, src){
-    try{ P.relayout(src, {'annotations': []}); }catch(e){}
+    var base = origShapes.get(src) || [];
+    try{ P.relayout(src, {'shapes': base, 'annotations': []}); }catch(e){}
   }
 
   function setup(){
@@ -679,6 +705,12 @@ if ticker:
     charts.forEach(function(src){
       if(attached.has(src)) return;
       attached.add(src);
+
+      /* snapshot original shapes (e.g. add_hline zero-line) */
+      try{
+        var sh = (src.layout&&src.layout.shapes) ? src.layout.shapes.slice() : [];
+        origShapes.set(src, sh);
+      }catch(e){ origShapes.set(src,[]); }
 
       /* ── crosshair sync ── */
       src.on('plotly_hover', function(d){
@@ -696,7 +728,7 @@ if ticker:
         });
       });
 
-      /* ── drag-to-delta (Plotly annotation overlay) ── */
+      /* ── snap-to-point drag measure ── */
       src.on('plotly_selected', function(ed){
         if(!ed||!ed.range||!ed.range.x){ clearDelta(P,src); return; }
         var x0=toDateStr(ed.range.x[0]);
@@ -706,36 +738,62 @@ if ticker:
         var tr=getMainTrace(src);
         if(!tr){ clearDelta(P,src); return; }
 
-        var sy=null, ey=null;
-        for(var j=0;j<tr.x.length;j++){
-          var xd=toDateStr(tr.x[j]);
-          var yv=parseFloat(tr.y[j]);
-          if(!Number.isFinite(yv)) continue;
-          if(sy===null&&xd>=x0) sy=yv;
-          if(xd<=x1) ey=yv;
-        }
-        if(!Number.isFinite(sy)||!Number.isFinite(ey)){ clearDelta(P,src); return; }
+        var p0=snapNearest(tr,x0);
+        var p1=snapNearest(tr,x1);
+        if(!p0||!p1||p0.x===p1.x){ clearDelta(P,src); return; }
 
-        var txt, color;
+        /* ensure p0 is the earlier date */
+        if(new Date(p0.x)>new Date(p1.x)){ var tmp=p0; p0=p1; p1=tmp; }
+
+        var sy=p0.y, ey=p1.y;
+        var txt, color, arrow;
+
         if(isPriceChart(src)){
-          var dp=ey-sy, pct=((ey/sy)-1)*100, sign=dp>=0?'+':'-';
-          txt=sign+'$'+Math.abs(dp).toFixed(2)+' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%)';
-          color=dp>=0?'#10b981':'#ef4444';
+          var dp=ey-sy, pct=((ey/sy)-1)*100;
+          arrow = dp>=0 ? '▲' : '▼';
+          color = dp>=0 ? '#10b981' : '#ef4444';
+          var sign = dp>=0?'+':'-';
+          txt = '<b>'+sign+'$'+Math.abs(dp).toFixed(2)
+              +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '
+              +arrow+'</b><br><span style="font-size:10px;opacity:0.85">'
+              +fmtDate(p0.x)+' – '+fmtDate(p1.x)+'</span>';
         } else {
-          var dpp=(ey-sy)*100, sign=dpp>=0?'+':'';
-          txt=sign+dpp.toFixed(1)+' pp';
-          color=dpp>=0?'#10b981':'#ef4444';
+          var dpp=(ey-sy)*100;
+          arrow = dpp>=0 ? '▲' : '▼';
+          color = dpp>=0 ? '#10b981' : '#ef4444';
+          var sign = dpp>=0?'+':'';
+          txt = '<b>'+(sign+dpp.toFixed(1))+' pp '+arrow+'</b>'
+              +'<br><span style="font-size:10px;opacity:0.85">'
+              +fmtDate(p0.x)+' – '+fmtDate(p1.x)+'</span>';
         }
+
+        /* two dashed vertical lines at snap points */
+        var vline = function(xval){ return {
+          type:'line', xref:'x', yref:'paper',
+          x0:xval, x1:xval, y0:0, y1:1,
+          line:{color:'rgba(180,180,200,0.7)', width:1.5, dash:'dot'},
+          layer:'above'
+        }; };
+
+        var base = origShapes.get(src) || [];
         try{
-          P.relayout(src, {'annotations': [{
-            x:0.99, y:0.98, xref:'paper', yref:'paper',
-            text:'<b>'+txt+'</b>',
-            showarrow:false,
-            font:{color:'#ffffff', size:12, family:'Inter, sans-serif'},
-            bgcolor:color, borderpad:5, borderwidth:0,
-            xanchor:'right', yanchor:'top',
-            opacity:0.92
-          }]});
+          P.relayout(src, {
+            'shapes': base.concat([vline(p0.x), vline(p1.x)]),
+            'annotations': [{
+              /* centered between the two snap lines in data coords */
+              xref: 'x',
+              x: new Date((new Date(p0.x).getTime()+new Date(p1.x).getTime())/2)
+                    .toISOString().substring(0,10),
+              y: 0.96, yref: 'paper',
+              text: txt,
+              showarrow: false,
+              font: {color:'#ffffff', size:12, family:'Inter, sans-serif'},
+              bgcolor: color,
+              borderpad: 6, borderwidth: 0,
+              xanchor: 'center', yanchor: 'top',
+              opacity: 0.93
+            }]
+          });
         }catch(e){}
       });
 
