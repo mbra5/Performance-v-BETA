@@ -3,7 +3,14 @@ Performance vs. Beta — Streamlit Dashboard
 ===========================================
 Run:  streamlit run dashboard/streamlit_app.py
 
-Type any US ticker, hit Enter or click Load.
+Changes in this version:
+  - Removed "0%" zero-line annotation from perf charts
+  - Removed date-range slider (period selectbox now controls window)
+  - Added "Custom" period option with from/to date pickers
+  - Info (ℹ) tooltip above each chart explains the methodology
+  - Pre-caches S&P 500 / S&P 1000 / QQQ + all indices; daily 4:15 PM refresh
+  - Data source note at bottom
+  - Drag on any chart measures change (price $±% or pp) instead of zooming
 """
 
 import sys, os
@@ -16,7 +23,7 @@ import pandas as pd
 from data import (load_data, get_company_name, INDEX_MAP,
                   normalize_ticker, search_ticker, YFINANCE_SUFFIX_INDEX_MAP)
 
-# ── Page config ─────────────────────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Perf vs Beta",
     page_icon="📈",
@@ -24,7 +31,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── CSS ──────────────────────────────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -101,7 +108,7 @@ st.markdown("""
     background: #2563eb !important; box-shadow: 0 4px 8px rgba(37,99,235,0.35) !important;
   }
 
-  /* ── Metric cards — all equal height, no delta ── */
+  /* ── Metric cards ── */
   div[data-testid="stMetric"],
   [data-testid="metric-container"] {
     background: #ffffff !important; border: 1px solid #e2e8f0 !important;
@@ -135,12 +142,14 @@ st.markdown("""
   /* ── Plotly chart cards ── */
   [data-testid="stPlotlyChart"] > div {
     background: #ffffff !important; border: 1px solid #e2e8f0 !important;
-    border-radius: 10px !important; overflow: hidden !important;
+    border-radius: 10px !important;
     box-shadow: 0 1px 2px rgba(15,23,42,0.04) !important; transition: box-shadow 0.2s ease !important;
   }
   [data-testid="stPlotlyChart"] > div:hover {
     box-shadow: 0 4px 8px rgba(15,23,42,0.08) !important;
   }
+  /* Allow delta-label overlay to escape the chart card */
+  [data-testid="stPlotlyChart"] { position: relative; overflow: visible !important; }
 
   /* ── Kill vertical gap between charts in each column ── */
   [data-testid="column"] [data-testid="stVerticalBlock"] { gap: 6px !important; }
@@ -176,10 +185,6 @@ st.markdown("""
     font-family: 'Inter', sans-serif;
   }
 
-  /* ── Date range slider ── */
-  [data-testid="stSlider"] { padding: 2px 0 6px 0 !important; }
-  [data-testid="stSlider"] label { display: none !important; }
-
   /* ── Mobile: single-column stack ── */
   @media (max-width: 768px) {
     [data-testid="column"] {
@@ -187,10 +192,49 @@ st.markdown("""
       min-width: 100% !important;
     }
   }
+
+  /* ── Chart info tooltips ── */
+  .chart-info-row {
+    display: flex; justify-content: flex-end;
+    margin-bottom: -2px; position: relative; z-index: 200;
+  }
+  .tip-wrap { position: relative; display: inline-block; }
+  .tip-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #e2e8f0; color: #475569;
+    font-size: 10px; font-weight: 800; font-style: italic;
+    font-family: Georgia, 'Times New Roman', serif;
+    cursor: help; user-select: none; line-height: 1;
+    transition: background 0.15s;
+  }
+  .tip-icon:hover { background: #cbd5e1; }
+  .tip-box {
+    visibility: hidden; opacity: 0;
+    position: absolute; right: 0; top: 22px;
+    background: #1e293b; color: #e2e8f0;
+    font-size: 11px; line-height: 1.65; font-weight: 400;
+    font-family: 'Inter', sans-serif;
+    padding: 10px 14px; border-radius: 8px;
+    width: 270px; z-index: 9999;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.35);
+    transition: opacity 0.15s;
+    pointer-events: none; white-space: normal; text-align: left;
+  }
+  .tip-wrap:hover .tip-box { visibility: visible; opacity: 1; }
+  /* Allow tooltip to overflow Streamlit block containers */
+  [data-testid="stMarkdown"], .element-container,
+  [data-testid="column"], [data-testid="stVerticalBlock"] { overflow: visible !important; }
+
+  /* ── Source note ── */
+  .source-note {
+    font-size: 10px; color: #94a3b8; text-align: right;
+    padding: 4px 8px 0 0; font-family: 'Inter', sans-serif;
+  }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ───────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="dash-header">
   <h1>📈 Performance vs. Beta</h1>
@@ -198,14 +242,27 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ── Pre-cache scheduler (starts once per server process) ─────────────────────
+@st.cache_resource
+def _init_scheduler():
+    try:
+        from pre_cache import start_scheduler
+        start_scheduler()
+    except Exception:
+        pass
+    return True
+
+_init_scheduler()
+
 # ── Cached data helpers ───────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def _search(q: str):
     return search_ticker(q)
 
 @st.cache_data(ttl=3600)
-def _load(ticker, index_key, period):
-    return load_data(ticker, index_key=index_key, period=period)
+def _load(ticker, index_key, period, custom_start=None, custom_end=None):
+    return load_data(ticker, index_key=index_key, period=period,
+                     start_date=custom_start, end_date=custom_end)
 
 @st.cache_data(ttl=86400)
 def _company(ticker):
@@ -230,7 +287,7 @@ if st.session_state.pending_index_sel is not None:
     st.session_state.index_sel = st.session_state.pending_index_sel
     st.session_state.pending_index_sel = None
 
-# ── Controls ─────────────────────────────────────────────────────────────────
+# ── Controls ──────────────────────────────────────────────────────────────────
 col_tick, col_idx, col_per, col_btn, col_copy, col_spacer = st.columns([2, 1.5, 1.5, 1, 1, 3])
 with col_tick:
     raw = st.text_input("Ticker", value="AAPL", label_visibility="visible").upper().strip()
@@ -244,7 +301,6 @@ if raw != st.session_state.last_raw:
 if st.session_state.ticker_override:
     ticker    = st.session_state.ticker_override
     exch_code = None
-    # Auto-detect index from yfinance suffix (e.g. "006400.KS" → KOSPI)
     if "." in ticker:
         suf = ticker.rsplit(".", 1)[-1]
         if suf in YFINANCE_SUFFIX_INDEX_MAP and suf != st.session_state.last_exch:
@@ -274,7 +330,7 @@ with col_idx:
     index_key = st.selectbox("vs. Index", list(INDEX_MAP.keys()), key="index_sel",
                               format_func=_fmt_idx)
 with col_per:
-    period = st.selectbox("Period", ["1y", "2y", "3y", "5y"], index=2)
+    period = st.selectbox("Period", ["1y", "2y", "3y", "5y", "Custom"], index=2)
 with col_btn:
     st.button("Load", use_container_width=True, type="primary")
 with col_copy:
@@ -324,6 +380,25 @@ async function run(){
 </script>
 """, height=38)
 
+# ── Custom date pickers ───────────────────────────────────────────────────────
+custom_start = custom_end = None
+if period == "Custom":
+    import datetime as _dt
+    cd1, cd2, _ = st.columns([1.5, 1.5, 7])
+    with cd1:
+        custom_start = st.date_input(
+            "From",
+            value=_dt.date.today() - _dt.timedelta(days=365),
+            max_value=_dt.date.today(),
+        )
+    with cd2:
+        custom_end = st.date_input(
+            "To",
+            value=_dt.date.today(),
+            min_value=custom_start if custom_start else None,
+            max_value=_dt.date.today(),
+        )
+
 # ── Ticker search suggestions ─────────────────────────────────────────────────
 if raw and len(raw) >= 2 and not st.session_state.ticker_override and exch_code is None:
     results  = _search(raw)
@@ -348,7 +423,7 @@ st.divider()
 # ── Load & render ─────────────────────────────────────────────────────────────
 if ticker:
     with st.spinner(f"Loading {ticker}…"):
-        df, error    = _load(ticker, index_key, period)
+        df, error    = _load(ticker, index_key, period, custom_start, custom_end)
         company_name = _company(ticker)
 
     if error or df.empty:
@@ -410,26 +485,10 @@ if ticker:
     _card(m4, "Perf vs Beta 4W",  f"{pvb_4w*100:+.1f}%",  _pcolor(pvb_4w))
     _card(m5, "Perf vs Beta 12W", f"{pvb_12w*100:+.1f}%", _pcolor(pvb_12w))
 
-    # ── Date range slider ─────────────────────────────────────────────────────
-    _min_d = df_plot["date"].iloc[0].date()
-    _max_d = df_plot["date"].iloc[-1].date()
-    _days  = {"1y": 365, "2y": 730, "3y": 1095, "5y": 1825}[period]
-    _def_s = max(_min_d, _max_d - pd.Timedelta(days=_days))
-    _rng   = st.slider(
-        "Date range",
-        min_value=_min_d, max_value=_max_d,
-        value=(_def_s, _max_d),
-        format="MM/DD/YY",
-        label_visibility="collapsed",
-        key=f"dr_{ticker}_{index_key}_{period}",
-    )
-    x_start = pd.Timestamp(_rng[0])
-    x_end   = pd.Timestamp(_rng[1])
-
     # ── Shared axis / layout helpers ──────────────────────────────────────────
-    # 1080p viewport (~940px) minus header+controls+divider+company+metrics+gaps ≈ 300px
-    # leaves ~640px for two chart rows → 320px each, minus small buffer = 285px
     CHART_H = 285
+    x_start = df_plot["date"].iloc[0]
+    x_end   = df_plot["date"].iloc[-1]
 
     _ax = dict(
         gridcolor=GRID, zerolinecolor=GRID, zerolinewidth=1,
@@ -455,11 +514,52 @@ if ticker:
             hoverlabel=dict(bgcolor=BG, bordercolor=GRID,
                             font=dict(color=TEXT, size=11, family="Inter, sans-serif")),
             showlegend=False,
+            # Drag to measure instead of zoom
+            dragmode="select",
+            selectdirection="h",
+            newselection=dict(line=dict(color="#3b82f6", width=1, dash="dot")),
+            activeselection=dict(fillcolor="rgba(59,130,246,0.04)"),
         )
 
     dates = df_plot["date"]
 
-    # ── Price chart (top-left) ────────────────────────────────────────────────
+    # ── Methodology tooltip helper ────────────────────────────────────────────
+    _BETA_METHOD = (
+        "Rolling beta = Cov(stock daily returns, index daily returns) "
+        "/ Var(index daily returns) over 126 trading days (~6 months)."
+    )
+
+    def _chart_tip(html: str):
+        st.markdown(
+            f'<div class="chart-info-row">'
+            f'<span class="tip-wrap"><span class="tip-icon">i</span>'
+            f'<span class="tip-box">{html}</span></span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    PRICE_TIP = (
+        "<b>Price Chart</b><br>"
+        "Adjusted closing price history.<br><br>"
+        "Drag between two dates to measure the price change ($ and %).<br><br>"
+        "Source: Yahoo Finance via yfinance."
+    )
+
+    def _perf_tip(label: str) -> str:
+        return (
+            f"<b>Perf vs. Beta — {label}</b><br><br>"
+            f"How much the stock outperformed (or underperformed) "
+            f"what its beta-adjusted market exposure would predict.<br><br>"
+            f"<b>Formula:</b><br>"
+            f"Actual {label} Return<br>"
+            f"&minus; (Rolling 6M Beta &times; {label} Index Return)<br><br>"
+            f"{_BETA_METHOD}<br><br>"
+            f"<span style='color:#6ee7b7'>Positive</span> = outperformed "
+            f"on a risk-adjusted basis.<br><br>"
+            f"Drag between two dates to measure the change in pp."
+        )
+
+    # ── Price chart ───────────────────────────────────────────────────────────
     fig_price = go.Figure()
     fig_price.add_trace(go.Scatter(
         x=dates, y=df_plot["stock_price"],
@@ -500,7 +600,6 @@ if ticker:
             hovertemplate="%{x|%b %d, %Y}<br><b>%{y:.2%}</b><extra></extra>",
         ))
         fig.add_hline(y=0, line_dash="solid", line_color=ZERO, line_width=1)
-        # Last data point dot
         fig.add_trace(go.Scatter(
             x=[dates.iloc[-1]], y=[y.iloc[-1]],
             mode="markers",
@@ -508,14 +607,6 @@ if ticker:
                         line=dict(color="white", width=1.5)),
             hoverinfo="skip",
         ))
-        # Zero-line label at right edge
-        fig.add_annotation(
-            x=1, y=0, text="0%", showarrow=False,
-            font=dict(color=MUTED, size=8, family="Inter, sans-serif"),
-            xanchor="right", yanchor="bottom",
-            xref="paper", yref="y",
-            bgcolor="rgba(255,255,255,0.75)", borderpad=2,
-        )
         fig.update_layout(**_base_layout(f"Perf vs. Beta — {label}  ({ticker} vs {index_key})"))
         fig.update_xaxes(range=[x_start, x_end], **_ax)
         fig.update_yaxes(tickformat=".1%", **_ax)
@@ -526,44 +617,146 @@ if ticker:
     fig_2w  = make_perf_fig("perf_vs_beta_2W",  AMBER,  "2 Week")
 
     # ── 2×2 grid: TL=Price, TR=12W, BL=4W, BR=2W ─────────────────────────────
-    # Single st.columns(2) — both charts per column stack without inter-row gap
     col_left, col_right = st.columns(2, gap="small")
 
     with col_left:
-        st.plotly_chart(fig_price, use_container_width=True)   # top-left
-        st.plotly_chart(fig_4w,   use_container_width=True)    # bottom-left
+        _chart_tip(PRICE_TIP)
+        st.plotly_chart(fig_price, use_container_width=True)
+        _chart_tip(_perf_tip("4 Week"))
+        st.plotly_chart(fig_4w,   use_container_width=True)
 
     with col_right:
-        st.plotly_chart(fig_12w,  use_container_width=True)    # top-right
-        st.plotly_chart(fig_2w,   use_container_width=True)    # bottom-right
+        _chart_tip(_perf_tip("12 Week"))
+        st.plotly_chart(fig_12w,  use_container_width=True)
+        _chart_tip(_perf_tip("2 Week"))
+        st.plotly_chart(fig_2w,   use_container_width=True)
 
-    # ── Crosshair sync across all 4 charts ───────────────────────────────────
+    # ── Source note ───────────────────────────────────────────────────────────
+    st.markdown(
+        '<p class="source-note">'
+        'Data: Yahoo Finance via yfinance &nbsp;·&nbsp; '
+        'Beta window: 126 trading days (~6 months) &nbsp;·&nbsp; '
+        'Drag on any chart to measure change between two dates'
+        '</p>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Crosshair sync + drag-to-delta ────────────────────────────────────────
     st.components.v1.html("""<script>
 (function(){
-  var attached=new WeakSet();
+  var attached = new WeakSet();
+  var deltaMap = new WeakMap();
+
+  function toDateStr(v){
+    if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
+    return String(v).substring(0,10);
+  }
+
+  function getDeltaDiv(chart){
+    if(deltaMap.has(chart)) return deltaMap.get(chart);
+    var wrap = chart.closest('[data-testid="stPlotlyChart"]');
+    if(!wrap) return null;
+    wrap.style.position = 'relative';
+    var d = window.parent.document.createElement('div');
+    d.style.cssText =
+      'position:absolute;top:8px;left:50%;transform:translateX(-50%);'
+      +'background:rgba(255,255,255,0.96);border-radius:6px;border:1.5px solid #e2e8f0;'
+      +'padding:3px 10px;font-size:12px;font-weight:700;font-family:Inter,sans-serif;'
+      +'pointer-events:none;z-index:9999;display:none;white-space:nowrap;'
+      +'box-shadow:0 2px 8px rgba(0,0,0,0.1);';
+    wrap.appendChild(d);
+    deltaMap.set(chart, d);
+    return d;
+  }
+
+  function getMainTrace(chart){
+    for(var i=0;i<chart.data.length;i++){
+      var t=chart.data[i];
+      if(!t.x||t.x.length<=1) continue;
+      if(t.mode==='markers') continue;
+      if(t.line&&t.line.width===0) continue;
+      return t;
+    }
+    return null;
+  }
+
+  function isPriceChart(chart){
+    try{ return (chart.layout.title.text||'').includes('Price Chart'); }
+    catch(e){ return false; }
+  }
+
   function setup(){
-    var P=window.parent.Plotly;
-    if(!P)return;
-    var charts=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+    var P = window.parent.Plotly;
+    if(!P) return;
+    var charts = [...window.parent.document.querySelectorAll('.js-plotly-plot')];
     charts.forEach(function(src){
-      if(attached.has(src))return;
+      if(attached.has(src)) return;
       attached.add(src);
-      src.on('plotly_hover',function(d){
-        if(!d.points||!d.points[0])return;
-        var xv=d.points[0].x;
-        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+
+      /* ── crosshair sync ── */
+      src.on('plotly_hover', function(d){
+        if(!d.points||!d.points[0]) return;
+        var xv = d.points[0].x;
+        var all = [...window.parent.document.querySelectorAll('.js-plotly-plot')];
         all.forEach(function(dst){
-          if(dst!==src)try{P.Fx.hover(dst,[{xval:xv}],'');}catch(e){}
+          if(dst!==src) try{ P.Fx.hover(dst,[{xval:xv}],''); }catch(e){}
         });
       });
-      src.on('plotly_unhover',function(){
-        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+      src.on('plotly_unhover', function(){
+        var all = [...window.parent.document.querySelectorAll('.js-plotly-plot')];
         all.forEach(function(dst){
-          if(dst!==src)try{P.Fx.hover(dst,[],'');}catch(e){}
+          if(dst!==src) try{ P.Fx.hover(dst,[],''); }catch(e){}
         });
+      });
+
+      /* ── drag-to-delta ── */
+      src.on('plotly_selected', function(ed){
+        var div = getDeltaDiv(src);
+        if(!div) return;
+        if(!ed||!ed.range||!ed.range.x){ div.style.display='none'; return; }
+
+        var x0 = toDateStr(ed.range.x[0]);
+        var x1 = toDateStr(ed.range.x[1]);
+
+        /* require at least 1 day of selection */
+        if(new Date(x1) - new Date(x0) < 86400000){ div.style.display='none'; return; }
+
+        var tr = getMainTrace(src);
+        if(!tr){ div.style.display='none'; return; }
+
+        var sy=null, ey=null;
+        for(var j=0;j<tr.x.length;j++){
+          var xd = toDateStr(tr.x[j]);
+          var yv = tr.y[j];
+          if(yv===null||yv!==yv) continue;    /* skip null/NaN */
+          if(sy===null && xd>=x0) sy=yv;
+          if(xd<=x1) ey=yv;
+        }
+        if(sy===null||ey===null){ div.style.display='none'; return; }
+
+        var txt, color;
+        if(isPriceChart(src)){
+          var dp=ey-sy, pct=((ey/sy)-1)*100, s=dp>=0?'+':'-';
+          txt = s+'$'+Math.abs(dp).toFixed(2)+' ('+( dp>=0?'+':'' )+pct.toFixed(1)+'%)';
+          color = dp>=0 ? '#10b981' : '#ef4444';
+        } else {
+          var dpp=(ey-sy)*100, s=dpp>=0?'+':'';
+          txt = s+dpp.toFixed(1)+' pp';
+          color = dpp>=0 ? '#10b981' : '#ef4444';
+        }
+        div.innerHTML = txt;
+        div.style.color = color;
+        div.style.borderColor = color;
+        div.style.display = 'block';
+      });
+
+      src.on('plotly_deselect', function(){
+        var div = getDeltaDiv(src);
+        if(div) div.style.display='none';
       });
     });
   }
-  setInterval(setup,800);
+
+  setInterval(setup, 800);
 })();
 </script>""", height=0)

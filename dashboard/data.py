@@ -49,7 +49,7 @@ BLOOMBERG_EXCHANGE_MAP = {
 }
 
 
-def normalize_ticker(raw: str) -> tuple[str, str | None, str | None]:
+def normalize_ticker(raw: str) -> tuple:
     """
     Normalize a Bloomberg-style ticker to yfinance format.
 
@@ -86,7 +86,7 @@ YFINANCE_SUFFIX_INDEX_MAP = {
 }
 
 
-def search_ticker(query: str, max_results: int = 5) -> list[dict]:
+def search_ticker(query: str, max_results: int = 5) -> list:
     """Search Yahoo Finance; returns list of {symbol, name, exchange}."""
     try:
         import requests
@@ -135,9 +135,14 @@ def load_data(
     ticker: str,
     index_key: str = "SPX",
     period: str = "3y",
-) -> tuple[pd.DataFrame, str]:
+    start_date=None,
+    end_date=None,
+) -> tuple:
     """
     Download price history for ticker and index, then compute all metrics.
+
+    If start_date and end_date are provided (datetime.date or str), they
+    override `period` and disk-cache is bypassed for that request.
 
     Returns
     -------
@@ -148,25 +153,10 @@ def load_data(
     error : str
         Empty string on success, error message on failure.
     """
-    index_yfin = INDEX_MAP.get(index_key.upper(), f"^{index_key}")
+    index_yfin  = INDEX_MAP.get(index_key.upper(), f"^{index_key}")
+    use_custom  = start_date is not None and end_date is not None
 
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            raw_stock = yf.download(ticker, period=period, interval="1d",
-                                    auto_adjust=True, progress=False)
-            raw_index = yf.download(index_yfin, period=period, interval="1d",
-                                    auto_adjust=True, progress=False)
-    except Exception as e:
-        return pd.DataFrame(), str(e)
-
-    if raw_stock.empty:
-        return pd.DataFrame(), f"No data found for ticker '{ticker}'. Check the symbol."
-    if raw_index.empty:
-        return pd.DataFrame(), f"No data found for index '{index_key}'."
-
-    # Extract closing prices — handle MultiIndex columns from yfinance v0.2+
-    # and fallback to "Adj Close" for markets that label it differently.
+    # ── Helper: extract close from a raw yfinance DataFrame ─────────────────
     def extract_close(raw):
         for col_name in ("Close", "Adj Close"):
             if isinstance(raw.columns, pd.MultiIndex):
@@ -177,29 +167,90 @@ def load_data(
                 return raw[col_name]
         raise ValueError(f"No close price column found; got: {list(raw.columns)[:5]}")
 
-    stock_px = extract_close(raw_stock).rename("stock_price")
-    index_px = extract_close(raw_index).rename("index_price")
+    # ── Try disk cache (standard periods only) ───────────────────────────────
+    stock_px = index_px = None
+    if not use_custom:
+        try:
+            from pre_cache import load_price_series
+            s = load_price_series(ticker, period)
+            if s is not None:
+                stock_px = s.rename("stock_price")
+            s = load_price_series(index_yfin, period)
+            if s is not None:
+                index_px = s.rename("index_price")
+        except ImportError:
+            pass
 
-    # Strip timezone so both series share a tz-naive DatetimeIndex before concat.
-    # International equities (e.g. .KS, .T) often return KST/JST-aware data.
+    # ── Download whatever is still missing from yfinance ────────────────────
+    raw_stock = raw_index = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            kw = dict(interval="1d", auto_adjust=True, progress=False)
+            if use_custom:
+                import datetime as _dt
+                kw["start"] = start_date
+                # yfinance end is exclusive; add one day to include end_date
+                kw["end"] = (
+                    end_date + _dt.timedelta(days=1)
+                    if hasattr(end_date, "year") else end_date
+                )
+            else:
+                kw["period"] = period
+
+            if stock_px is None:
+                raw_stock = yf.download(ticker, **kw)
+            if index_px is None:
+                raw_index = yf.download(index_yfin, **kw)
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+    # ── Extract close prices from raw downloads ──────────────────────────────
+    if stock_px is None:
+        if raw_stock is None or raw_stock.empty:
+            return pd.DataFrame(), f"No data found for ticker '{ticker}'. Check the symbol."
+        stock_px = extract_close(raw_stock).rename("stock_price")
+        # Persist to disk cache for future requests
+        if not use_custom:
+            try:
+                from pre_cache import save_price_series, is_cache_fresh, price_cache_path
+                if not is_cache_fresh(price_cache_path(ticker, period)):
+                    save_price_series(ticker, stock_px, period)
+            except ImportError:
+                pass
+
+    if index_px is None:
+        if raw_index is None or raw_index.empty:
+            return pd.DataFrame(), f"No data found for index '{index_key}'."
+        index_px = extract_close(raw_index).rename("index_price")
+        if not use_custom:
+            try:
+                from pre_cache import save_price_series, is_cache_fresh, price_cache_path
+                if not is_cache_fresh(price_cache_path(index_yfin, period)):
+                    save_price_series(index_yfin, index_px, period)
+            except ImportError:
+                pass
+
+    # ── Strip timezone so both series share a tz-naive DatetimeIndex ─────────
     if isinstance(stock_px.index, pd.DatetimeIndex) and stock_px.index.tz is not None:
         stock_px.index = stock_px.index.tz_localize(None)
     if isinstance(index_px.index, pd.DatetimeIndex) and index_px.index.tz is not None:
         index_px.index = index_px.index.tz_localize(None)
 
-    # Align to common trading days
+    # ── Align to common trading days ─────────────────────────────────────────
     df = pd.concat([stock_px, index_px], axis=1).dropna()
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
 
-    # Daily returns
+    # ── Daily returns ────────────────────────────────────────────────────────
     df["stock_daily"] = df["stock_price"].pct_change()
     df["index_daily"] = df["index_price"].pct_change()
 
-    # Rolling 6M beta (126-day rolling window)
+    # ── Rolling 6M beta (126-day rolling window) ─────────────────────────────
     df["beta"] = _rolling_beta(df["stock_daily"], df["index_daily"], BETA_WINDOW)
 
-    # Per-timeframe metrics
+    # ── Per-timeframe metrics ────────────────────────────────────────────────
     for label, days in WINDOWS.items():
         s_ret = df["stock_price"].pct_change(days)
         i_ret = df["index_price"].pct_change(days)
