@@ -782,27 +782,37 @@ if ticker:
     shapeRelayout(P,src,(origShapes.get(src)||[]).concat([vline(p0.x),vline(p1.x)]));
   }
 
-  /* Document-level mouseup: after a drag on any chart, wait 200 ms for Plotly
-     to finish processing and write _fullLayout.selections, then read it directly.
-     This avoids relying on plotly_selecting / plotly_selected which are
-     unreliable for line charts in select mode. */
+  /* Convert a clientX pixel position to an ISO date string using Plotly's
+     axis range and the bounding rect of the plot-area drag layer (.nsewdrag).
+     This works without any Plotly events — purely from DOM geometry. */
+  function pixelToX(src,clientX){
+    try{
+      var xaxis=src._fullLayout.xaxis;
+      var drag=src.querySelector('.nsewdrag');
+      if(!drag) return null;
+      var bb=drag.getBoundingClientRect();
+      var frac=Math.max(0,Math.min(1,(clientX-bb.left)/bb.width));
+      var r0=xaxis.range[0],r1=xaxis.range[1];
+      var t0=(typeof r0==='number')?r0:new Date(String(r0).substring(0,10)+'T00:00:00Z').getTime();
+      var t1=(typeof r1==='number')?r1:new Date(String(r1).substring(0,10)+'T00:00:00Z').getTime();
+      return new Date(t0+frac*(t1-t0)).toISOString().substring(0,10);
+    }catch(e){return null;}
+  }
+
+  /* Document-level mouseup: compute x-range from mousedown + mouseup pixel positions,
+     converted to dates via pixelToX — no Plotly selection events needed. */
   window.parent.document.addEventListener('mouseup', function(e){
     if(e.button!==0) return;
     var P=window.parent.Plotly;
     if(!P) return;
     [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(src){
-      var startX=dragStart.get(src);
-      if(startX==null) return;
+      var start=dragStart.get(src);
+      if(!start) return;
       dragStart.delete(src);
-      if(Math.abs(e.clientX-startX)<10) return; // click, not drag
-      setTimeout(function(){
-        try{
-          var sels=(src._fullLayout||{}).selections;
-          if(!sels||!sels.length) return;
-          var s=sels[0];
-          if(s&&s.x0!=null&&s.x1!=null) handleSel(P,src,s.x0,s.x1);
-        }catch(err){}
-      },200);
+      if(Math.abs(e.clientX-start.clientX)<10) return; // click, not drag
+      var x0=start.dateStr;
+      var x1=pixelToX(src,e.clientX);
+      if(x0&&x1) handleSel(P,src,x0,x1);
     });
   },false);
 
@@ -817,9 +827,10 @@ if ticker:
         origShapes.set(src,(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[]);
       }catch(e){origShapes.set(src,[]);}
 
-      /* record drag start on mousedown */
+      /* record drag start: store both clientX and data-date at mousedown */
       src.addEventListener('mousedown',function(e){
-        if(e.button===0) dragStart.set(src,e.clientX);
+        if(e.button!==0) return;
+        dragStart.set(src,{clientX:e.clientX,dateStr:pixelToX(src,e.clientX)});
       });
 
       /* clear on double-click */
