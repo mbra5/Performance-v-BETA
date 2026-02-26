@@ -852,12 +852,12 @@ if ticker:
         if(!d.points||!d.points[0]) return;
         var xv=d.points[0].x;
         charts().forEach(function(dst){
-          if(dst!==src) try{P.Fx.hover(dst,[{xval:xv}],'');}catch(ex){}
+          if(dst!==src) try{P.Fx.hover(dst,[{xval:xv}],'xy');}catch(ex){}
         });
       });
       src.on('plotly_unhover',function(){
         charts().forEach(function(dst){
-          if(dst!==src) try{P.Fx.hover(dst,[],'');}catch(ex){}
+          if(dst!==src) try{P.Fx.hover(dst,[],'xy');}catch(ex){}
         });
       });
     });
