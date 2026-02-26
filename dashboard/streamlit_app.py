@@ -435,6 +435,14 @@ if ticker:
     # Trim burn-in rows (12W needs 60 days before first valid value)
     df_plot = df.dropna(subset=["perf_vs_beta_12W", "perf_vs_beta_4W", "perf_vs_beta_2W"]).copy()
 
+    if df_plot.empty:
+        st.error(
+            f"Not enough price history for **{ticker}** to compute rolling metrics. "
+            f"At least ~6 months of data is required (for the beta window). "
+            f"The ticker may be too recently listed or may not exist."
+        )
+        st.stop()
+
     # ── Palette ───────────────────────────────────────────────────────────────
     ACCENT  = "#3b82f6"
     PURPLE  = "#8b5cf6"
