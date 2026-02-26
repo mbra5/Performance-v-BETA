@@ -539,11 +539,6 @@ if ticker:
             hoverlabel=dict(bgcolor=BG, bordercolor=GRID,
                             font=dict(color=TEXT, size=11, family="Inter, sans-serif")),
             showlegend=False,
-            # Drag to measure instead of zoom
-            dragmode="select",
-            selectdirection="h",
-            newselection=dict(line=dict(color="#3b82f6", width=1, dash="dot")),
-            activeselection=dict(fillcolor="rgba(59,130,246,0.04)"),
         )
 
     dates = df_plot["date"]
@@ -566,7 +561,6 @@ if ticker:
     PRICE_TIP = (
         "<b>Price Chart</b><br>"
         "Adjusted closing price history.<br><br>"
-        "Drag between two dates to measure the price change ($ and %).<br><br>"
         "Source: Yahoo Finance via yfinance."
     )
 
@@ -580,8 +574,7 @@ if ticker:
             f"&minus; (Rolling 6M Beta &times; {label} Index Return)<br><br>"
             f"{_BETA_METHOD}<br><br>"
             f"<span style='color:#6ee7b7'>Positive</span> = outperformed "
-            f"on a risk-adjusted basis.<br><br>"
-            f"Drag between two dates to measure the change in pp."
+            f"on a risk-adjusted basis."
         )
 
     # ── Price chart ───────────────────────────────────────────────────────────
@@ -676,171 +669,16 @@ if ticker:
         unsafe_allow_html=True,
     )
 
-    # ── Crosshair sync + drag-to-measure ─────────────────────────────────────
+    # ── Crosshair sync ────────────────────────────────────────────────────────
     st.components.v1.html("""<script>
 (function(){
-  var attached     = new WeakSet();
-  var origShapes   = new WeakMap();
-  var tipMap       = new WeakMap();
-  var selfRelayout = new WeakSet();
-  /* dragStart: chart element → clientX at mousedown */
-  var dragStart    = new WeakMap();
-
-  function toDateStr(v){
-    if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
-    return String(v).substring(0,10);
-  }
-  function fmtDate(s){
-    var d=new Date(s+'T00:00:00');
-    return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
-  }
-  function getMainTrace(chart){
-    for(var i=0;i<chart.data.length;i++){
-      var t=chart.data[i];
-      if(!t.x||t.x.length<=1) continue;
-      if(t.mode==='markers') continue;
-      if(t.line&&Number(t.line.width)===0) continue;
-      return t;
-    }
-    return null;
-  }
-  function isPriceChart(chart){
-    try{ return (chart.layout.title.text||'').includes('Price Chart'); }
-    catch(e){ return false; }
-  }
-  function snapNearest(tr,targetDate){
-    var best=null,bestDiff=Infinity,td=new Date(targetDate).getTime();
-    for(var j=0;j<tr.x.length;j++){
-      var yv=parseFloat(tr.y[j]);
-      if(!Number.isFinite(yv)) continue;
-      var xd=toDateStr(tr.x[j]);
-      var diff=Math.abs(new Date(xd).getTime()-td);
-      if(diff<bestDiff){ bestDiff=diff; best={x:xd,y:yv}; }
-    }
-    return best;
-  }
-  function getTip(src){
-    if(tipMap.has(src)) return tipMap.get(src);
-    var d=window.parent.document.createElement('div');
-    d.style.cssText='position:fixed;z-index:99999;pointer-events:none;display:none;'
-      +'padding:6px 12px;border-radius:6px;font:bold 12px/1.5 Inter,sans-serif;'
-      +'white-space:nowrap;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.45);';
-    window.parent.document.body.appendChild(d);
-    tipMap.set(src,d);
-    return d;
-  }
-  function showTip(src,html,color){
-    var tip=getTip(src);
-    tip.style.background=color;
-    tip.innerHTML=html;
-    tip.style.display='block';
-    try{
-      var sr=src.getBoundingClientRect();
-      tip.style.left=(sr.left+sr.width/2)+'px';
-      tip.style.top=(sr.top+12)+'px';
-      tip.style.transform='translateX(-50%)';
-    }catch(e){}
-  }
-  function hideTip(src){
-    if(tipMap.has(src)) tipMap.get(src).style.display='none';
-  }
-  function shapeRelayout(P,src,shapes){
-    selfRelayout.add(src);
-    try{ P.relayout(src,{'shapes':shapes}); }catch(e){}
-    setTimeout(function(){ selfRelayout.delete(src); },0);
-  }
-  function handleSel(P,src,rawX0,rawX1){
-    if(rawX0==null||rawX1==null) return;
-    var x0=toDateStr(rawX0),x1=toDateStr(rawX1);
-    if(new Date(x0)>new Date(x1)){var tmp=x0;x0=x1;x1=tmp;}
-    if(new Date(x1)-new Date(x0)<86400000) return;
-    var tr=getMainTrace(src);
-    if(!tr) return;
-    var p0=snapNearest(tr,x0),p1=snapNearest(tr,x1);
-    if(!p0||!p1||p0.x===p1.x) return;
-    if(new Date(p0.x)>new Date(p1.x)){var tmp=p0;p0=p1;p1=tmp;}
-    var sy=p0.y,ey=p1.y,txt,color,arrow;
-    if(isPriceChart(src)){
-      var dp=ey-sy,pct=((ey/sy)-1)*100;
-      arrow=dp>=0?'▲':'▼'; color=dp>=0?'#10b981':'#ef4444';
-      txt='<b>'+(dp>=0?'+':'-')+'$'+Math.abs(dp).toFixed(2)
-         +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '+arrow+'</b>'
-         +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
-         +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
-    }else{
-      var dpp=(ey-sy)*100;
-      arrow=dpp>=0?'▲':'▼'; color=dpp>=0?'#10b981':'#ef4444';
-      txt='<b>'+(dpp>=0?'+':'')+dpp.toFixed(1)+' pp '+arrow+'</b>'
-         +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
-         +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
-    }
-    showTip(src,txt,color);
-    var vline=function(xv){return{
-      type:'line',xref:'x',yref:'paper',x0:xv,x1:xv,y0:0,y1:1,
-      line:{color:'rgba(180,180,200,.7)',width:1.5,dash:'dot'},layer:'above'
-    };};
-    shapeRelayout(P,src,(origShapes.get(src)||[]).concat([vline(p0.x),vline(p1.x)]));
-  }
-
-  /* Convert a clientX pixel position to an ISO date string using Plotly's
-     axis range and the bounding rect of the plot-area drag layer (.nsewdrag).
-     This works without any Plotly events — purely from DOM geometry. */
-  function pixelToX(src,clientX){
-    try{
-      var xaxis=src._fullLayout.xaxis;
-      var drag=src.querySelector('.nsewdrag');
-      if(!drag) return null;
-      var bb=drag.getBoundingClientRect();
-      var frac=Math.max(0,Math.min(1,(clientX-bb.left)/bb.width));
-      var r0=xaxis.range[0],r1=xaxis.range[1];
-      var t0=(typeof r0==='number')?r0:new Date(String(r0).substring(0,10)+'T00:00:00Z').getTime();
-      var t1=(typeof r1==='number')?r1:new Date(String(r1).substring(0,10)+'T00:00:00Z').getTime();
-      return new Date(t0+frac*(t1-t0)).toISOString().substring(0,10);
-    }catch(e){return null;}
-  }
-
-  /* Document-level mouseup: compute x-range from mousedown + mouseup pixel positions,
-     converted to dates via pixelToX — no Plotly selection events needed. */
-  window.parent.document.addEventListener('mouseup', function(e){
-    if(e.button!==0) return;
-    var P=window.parent.Plotly;
-    if(!P) return;
-    [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(src){
-      var start=dragStart.get(src);
-      if(!start) return;
-      dragStart.delete(src);
-      if(Math.abs(e.clientX-start.clientX)<10) return; // click, not drag
-      var x0=start.dateStr;
-      var x1=pixelToX(src,e.clientX);
-      if(x0&&x1) handleSel(P,src,x0,x1);
-    });
-  },false);
-
+  var attached=new WeakSet();
   function setup(){
     var P=window.parent.Plotly;
     if(!P) return;
-    var charts=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
-    charts.forEach(function(src){
+    [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(src){
       if(attached.has(src)) return;
       attached.add(src);
-      try{
-        origShapes.set(src,(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[]);
-      }catch(e){origShapes.set(src,[]);}
-
-      /* record drag start: store both clientX and data-date at mousedown */
-      src.addEventListener('mousedown',function(e){
-        if(e.button!==0) return;
-        dragStart.set(src,{clientX:e.clientX,dateStr:pixelToX(src,e.clientX)});
-      });
-
-      /* clear on double-click */
-      src.addEventListener('dblclick',function(){
-        dragStart.delete(src);
-        hideTip(src);
-        shapeRelayout(P,src,origShapes.get(src)||[]);
-      });
-
-      /* crosshair sync */
       src.on('plotly_hover',function(d){
         if(!d.points||!d.points[0]) return;
         var xv=d.points[0].x;
@@ -855,7 +693,6 @@ if ticker:
       });
     });
   }
-
   setInterval(setup,800);
 })();
 </script>""", height=0)
