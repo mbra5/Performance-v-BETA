@@ -139,20 +139,34 @@ def get_universe_tickers() -> list:
 # ── Batch pre-fetch ─────────────────────────────────────────────────────────
 
 def _extract_close_multi(raw: pd.DataFrame, ticker: str) -> "pd.Series | None":
-    """Pull the Close series for one ticker from a multi-ticker download."""
+    """Pull the Close series for one ticker from a multi-ticker download.
+
+    Handles both yfinance MultiIndex layouts:
+      - Old:  (ticker, metric)  e.g. ("AAPL", "Close")  — ticker in level-0
+      - New:  (metric, ticker)  e.g. ("Close", "AAPL")  — ticker in level-1
+    """
     try:
         if isinstance(raw.columns, pd.MultiIndex):
             lvl0 = raw.columns.get_level_values(0).unique().tolist()
+            lvl1 = raw.columns.get_level_values(1).unique().tolist()
             if ticker in lvl0:
+                # Old yfinance: level-0 = ticker, level-1 = metric
                 sub = raw[ticker]
                 for col in ("Close", "Adj Close"):
                     if col in sub.columns:
                         s = sub[col]
                         return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
+            elif ticker in lvl1:
+                # New yfinance: level-0 = metric, level-1 = ticker
+                for col in ("Close", "Adj Close"):
+                    if col in lvl0:
+                        s = raw[col][ticker]
+                        return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
         else:
             for col in ("Close", "Adj Close"):
                 if col in raw.columns:
-                    return raw[col]
+                    s = raw[col]
+                    return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
     except Exception:
         pass
     return None
