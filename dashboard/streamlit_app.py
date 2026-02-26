@@ -585,15 +585,24 @@ if ticker:
         )
 
     # ── Price chart ───────────────────────────────────────────────────────────
+    _px      = df_plot["stock_price"]
+    _px_pad  = (_px.max() - _px.min()) * 0.05
+    _px_base = _px.min() - _px_pad
+
     fig_price = go.Figure()
+    # Invisible baseline so fill stays above the data minimum (not zero)
     fig_price.add_trace(go.Scatter(
-        x=dates, y=df_plot["stock_price"],
+        x=dates, y=[_px_base] * len(dates),
+        line=dict(width=0), hoverinfo="skip", showlegend=False,
+    ))
+    fig_price.add_trace(go.Scatter(
+        x=dates, y=_px,
+        fill="tonexty", fillcolor="rgba(16,185,129,0.08)",
         line=dict(color=GREEN, width=1.8),
-        fill="tozeroy", fillcolor="rgba(16,185,129,0.08)",
         hovertemplate="%{x|%b %d, %Y}<br><b>$%{y:,.2f}</b><extra></extra>",
     ))
     fig_price.add_trace(go.Scatter(
-        x=[dates.iloc[-1]], y=[df_plot["stock_price"].iloc[-1]],
+        x=[dates.iloc[-1]], y=[_px.iloc[-1]],
         mode="markers",
         marker=dict(color=GREEN, size=7, symbol="circle",
                     line=dict(color="white", width=1.5)),
@@ -644,17 +653,19 @@ if ticker:
     # ── 2×2 grid: TL=Price, TR=12W, BL=4W, BR=2W ─────────────────────────────
     col_left, col_right = st.columns(2, gap="small")
 
+    _cfg = {"displayModeBar": False}
+
     with col_left:
         _chart_tip(PRICE_TIP)
-        st.plotly_chart(fig_price, use_container_width=True)
+        st.plotly_chart(fig_price, use_container_width=True, config=_cfg)
         _chart_tip(_perf_tip("4 Week"))
-        st.plotly_chart(fig_4w,   use_container_width=True)
+        st.plotly_chart(fig_4w,   use_container_width=True, config=_cfg)
 
     with col_right:
         _chart_tip(_perf_tip("12 Week"))
-        st.plotly_chart(fig_12w,  use_container_width=True)
+        st.plotly_chart(fig_12w,  use_container_width=True, config=_cfg)
         _chart_tip(_perf_tip("2 Week"))
-        st.plotly_chart(fig_2w,   use_container_width=True)
+        st.plotly_chart(fig_2w,   use_container_width=True, config=_cfg)
 
     # ── Source note ───────────────────────────────────────────────────────────
     st.markdown(
@@ -672,8 +683,8 @@ if ticker:
   var origShapes   = new WeakMap();
   var tipMap       = new WeakMap();
   var selfRelayout = new WeakSet();
-  /* selRanges: chart element → [x0, x1] captured from plotly_selecting */
-  var selRanges    = new WeakMap();
+  /* dragStart: chart element → clientX at mousedown */
+  var dragStart    = new WeakMap();
 
   function toDateStr(v){
     if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
@@ -739,7 +750,7 @@ if ticker:
     setTimeout(function(){ selfRelayout.delete(src); },0);
   }
   function handleSel(P,src,rawX0,rawX1){
-    if(!rawX0||!rawX1) return;
+    if(rawX0==null||rawX1==null) return;
     var x0=toDateStr(rawX0),x1=toDateStr(rawX1);
     if(new Date(x0)>new Date(x1)){var tmp=x0;x0=x1;x1=tmp;}
     if(new Date(x1)-new Date(x0)<86400000) return;
@@ -771,24 +782,29 @@ if ticker:
     shapeRelayout(P,src,(origShapes.get(src)||[]).concat([vline(p0.x),vline(p1.x)]));
   }
 
-  /* Document-level mouseup (capture phase) fires before Plotly clears the drag.
-     We read selRanges (populated by plotly_selecting) and schedule the tooltip.
-     plotly_selected (if it fires with a range) deletes the entry first so we
-     don't double-fire; if plotly_selected doesn't provide range data we fall back. */
+  /* Document-level mouseup: after a drag on any chart, wait 200 ms for Plotly
+     to finish processing and write _fullLayout.selections, then read it directly.
+     This avoids relying on plotly_selecting / plotly_selected which are
+     unreliable for line charts in select mode. */
   window.parent.document.addEventListener('mouseup', function(e){
     if(e.button!==0) return;
     var P=window.parent.Plotly;
     if(!P) return;
     [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(src){
-      var r=selRanges.get(src);
-      if(!r) return;
+      var startX=dragStart.get(src);
+      if(startX==null) return;
+      dragStart.delete(src);
+      if(Math.abs(e.clientX-startX)<10) return; // click, not drag
       setTimeout(function(){
-        var still=selRanges.get(src); // plotly_selected may have deleted it
-        selRanges.delete(src);
-        if(still) handleSel(P,src,still[0],still[1]);
-      }, 100);
+        try{
+          var sels=(src._fullLayout||{}).selections;
+          if(!sels||!sels.length) return;
+          var s=sels[0];
+          if(s&&s.x0!=null&&s.x1!=null) handleSel(P,src,s.x0,s.x1);
+        }catch(err){}
+      },200);
     });
-  }, true);
+  },false);
 
   function setup(){
     var P=window.parent.Plotly;
@@ -800,6 +816,18 @@ if ticker:
       try{
         origShapes.set(src,(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[]);
       }catch(e){origShapes.set(src,[]);}
+
+      /* record drag start on mousedown */
+      src.addEventListener('mousedown',function(e){
+        if(e.button===0) dragStart.set(src,e.clientX);
+      });
+
+      /* clear on double-click */
+      src.addEventListener('dblclick',function(){
+        dragStart.delete(src);
+        hideTip(src);
+        shapeRelayout(P,src,origShapes.get(src)||[]);
+      });
 
       /* crosshair sync */
       src.on('plotly_hover',function(d){
@@ -813,34 +841,6 @@ if ticker:
         [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(dst){
           if(dst!==src) try{P.Fx.hover(dst,[],'');}catch(e){}
         });
-      });
-
-      /* plotly_selecting fires on every mousemove during drag — save latest range */
-      src.on('plotly_selecting',function(ed){
-        if(ed&&ed.range&&ed.range.x&&ed.range.x.length>=2){
-          selRanges.set(src,[ed.range.x[0],ed.range.x[1]]);
-        }
-      });
-
-      /* plotly_selected fires on drag release — use range directly if available,
-         and delete from selRanges to prevent the mouseup fallback from re-firing */
-      src.on('plotly_selected',function(eventData){
-        selRanges.delete(src);
-        if(!eventData||!eventData.range||!eventData.range.x||eventData.range.x.length<2) return;
-        handleSel(P,src,eventData.range.x[0],eventData.range.x[1]);
-      });
-
-      /* clear on deselect (double-click or click outside selection) */
-      src.on('plotly_deselect',function(){
-        selRanges.delete(src);
-        hideTip(src);
-        shapeRelayout(P,src,origShapes.get(src)||[]);
-      });
-
-      src.on('plotly_doubleclick',function(){
-        selRanges.delete(src);
-        hideTip(src);
-        shapeRelayout(P,src,origShapes.get(src)||[]);
       });
     });
   }
