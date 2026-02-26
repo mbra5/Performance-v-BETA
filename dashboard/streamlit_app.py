@@ -672,6 +672,8 @@ if ticker:
   var origShapes   = new WeakMap();
   var tipMap       = new WeakMap();
   var selfRelayout = new WeakSet();
+  /* selRanges: chart element → [x0, x1] captured from plotly_selecting */
+  var selRanges    = new WeakMap();
 
   function toDateStr(v){
     if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
@@ -769,6 +771,25 @@ if ticker:
     shapeRelayout(P,src,(origShapes.get(src)||[]).concat([vline(p0.x),vline(p1.x)]));
   }
 
+  /* Document-level mouseup (capture phase) fires before Plotly clears the drag.
+     We read selRanges (populated by plotly_selecting) and schedule the tooltip.
+     plotly_selected (if it fires with a range) deletes the entry first so we
+     don't double-fire; if plotly_selected doesn't provide range data we fall back. */
+  window.parent.document.addEventListener('mouseup', function(e){
+    if(e.button!==0) return;
+    var P=window.parent.Plotly;
+    if(!P) return;
+    [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(src){
+      var r=selRanges.get(src);
+      if(!r) return;
+      setTimeout(function(){
+        var still=selRanges.get(src); // plotly_selected may have deleted it
+        selRanges.delete(src);
+        if(still) handleSel(P,src,still[0],still[1]);
+      }, 100);
+    });
+  }, true);
+
   function setup(){
     var P=window.parent.Plotly;
     if(!P) return;
@@ -794,39 +815,30 @@ if ticker:
         });
       });
 
-      /* drag-to-measure: Plotly fires plotly_relayout with selections data
-         in one of three formats depending on Plotly.js version:
-           A) ed.selections = [{x0, x1, ...}]          (array)
-           B) ed['selections[0].x0'] = value            (dot-notation keys)
-           C) only _fullLayout is updated, ed is partial */
-      src.on('plotly_relayout',function(ed){
-        if(selfRelayout.has(src)) return;
-        var keys=Object.keys(ed);
-        var hasSel=keys.some(function(k){return k==='selections'||k.startsWith('selections[');});
-        if(!hasSel) return;
+      /* plotly_selecting fires on every mousemove during drag — save latest range */
+      src.on('plotly_selecting',function(ed){
+        if(ed&&ed.range&&ed.range.x&&ed.range.x.length>=2){
+          selRanges.set(src,[ed.range.x[0],ed.range.x[1]]);
+        }
+      });
 
-        var x0,x1;
-        /* Format A */
-        if(Array.isArray(ed.selections)&&ed.selections.length){
-          x0=ed.selections[0].x0; x1=ed.selections[0].x1;
-        }
-        /* Format B */
-        else if(ed['selections[0].x0']!==undefined){
-          x0=ed['selections[0].x0']; x1=ed['selections[0].x1'];
-        }
-        /* Format C: read from _fullLayout */
-        else{
-          var fl=(src._fullLayout||src.layout||{});
-          if(fl.selections&&fl.selections.length){x0=fl.selections[0].x0;x1=fl.selections[0].x1;}
-        }
+      /* plotly_selected fires on drag release — use range directly if available,
+         and delete from selRanges to prevent the mouseup fallback from re-firing */
+      src.on('plotly_selected',function(eventData){
+        selRanges.delete(src);
+        if(!eventData||!eventData.range||!eventData.range.x||eventData.range.x.length<2) return;
+        handleSel(P,src,eventData.range.x[0],eventData.range.x[1]);
+      });
 
-        if(x0===undefined||x1===undefined){
-          hideTip(src); shapeRelayout(P,src,origShapes.get(src)||[]); return;
-        }
-        handleSel(P,src,x0,x1);
+      /* clear on deselect (double-click or click outside selection) */
+      src.on('plotly_deselect',function(){
+        selRanges.delete(src);
+        hideTip(src);
+        shapeRelayout(P,src,origShapes.get(src)||[]);
       });
 
       src.on('plotly_doubleclick',function(){
+        selRanges.delete(src);
         hideTip(src);
         shapeRelayout(P,src,origShapes.get(src)||[]);
       });
