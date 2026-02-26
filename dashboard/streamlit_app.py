@@ -244,9 +244,17 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Pre-cache scheduler (starts once per server process) ─────────────────────
+# ── Pre-cache scheduler (local only — disabled on Streamlit Cloud) ────────────
+import os as _os
+_ON_CLOUD = bool(
+    _os.getenv("STREAMLIT_SHARING_MODE")        # set by Streamlit Community Cloud
+    or "/mount/src" in _os.path.abspath(__file__)  # Cloud path convention
+)
+
 @st.cache_resource
 def _init_scheduler():
+    if _ON_CLOUD:
+        return False   # skip scheduler on Cloud to avoid cache corruption
     try:
         from pre_cache import start_scheduler
         start_scheduler()

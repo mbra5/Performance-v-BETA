@@ -167,9 +167,16 @@ def load_data(
                 return raw[col_name]
         raise ValueError(f"No close price column found; got: {list(raw.columns)[:5]}")
 
-    # ── Try disk cache (standard periods only) ───────────────────────────────
+    # ── Try disk cache (standard periods, local only) ────────────────────────
+    # Disabled on Streamlit Cloud: the background pre_cache scheduler can save
+    # corrupted data (due to yfinance MultiIndex format) before data.py has a
+    # chance to write correct prices, so Cloud always downloads fresh via yfinance.
+    _on_cloud = bool(
+        os.environ.get("STREAMLIT_SHARING_MODE")
+        or "/mount/src" in os.path.abspath(__file__)
+    )
     stock_px = index_px = None
-    if not use_custom:
+    if not use_custom and not _on_cloud:
         try:
             from pre_cache import load_price_series
             s = load_price_series(ticker, period)
