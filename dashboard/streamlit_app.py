@@ -643,18 +643,14 @@ if ticker:
     )
 
     # ── Crosshair sync + snap-to-point drag measure ───────────────────────────
-    # Root-cause fix: Plotly's `newselection` API (which draws the blue box) does
-    # NOT fire `plotly_selected`. Instead it fires `plotly_relayout` with keys like
-    # "selections[0].x0" whenever the selection changes. We listen for those.
-    # To avoid a relayout loop (our own shape-update relayout re-triggering the
-    # selection handler) we set a per-chart flag via `selfRelayout` while calling
-    # P.relayout for shapes, and skip the handler while that flag is set.
     st.components.v1.html("""<script>
 (function(){
-  var attached    = new WeakSet();
-  var origShapes  = new WeakMap();
-  var tipMap      = new WeakMap();
-  var selfRelayout = new WeakSet(); // set while we're issuing a shape relayout
+  var attached     = new WeakSet();
+  var origShapes   = new WeakMap();
+  var tipMap       = new WeakMap();
+  var selfRelayout = new WeakSet();
+  var activeDrag   = null;   // {src, P, x0client} — set on mousedown
+  var docListenerAdded = false;
 
   /* ── helpers ── */
   function toDateStr(v){
@@ -680,8 +676,7 @@ if ticker:
     catch(e){ return false; }
   }
   function snapNearest(tr,targetDate){
-    var best=null, bestDiff=Infinity;
-    var td=new Date(targetDate).getTime();
+    var best=null,bestDiff=Infinity,td=new Date(targetDate).getTime();
     for(var j=0;j<tr.x.length;j++){
       var yv=parseFloat(tr.y[j]);
       if(!Number.isFinite(yv)) continue;
@@ -692,7 +687,21 @@ if ticker:
     return best;
   }
 
-  /* ── DOM tooltip (fixed-position div in parent body) ── */
+  /* Convert a clientX pixel to a date string using Plotly's axis internals */
+  function clientXToDate(src,clientX){
+    try{
+      var xa=src._fullLayout.xaxis;
+      var r=src.getBoundingClientRect();
+      /* xa._offset = left margin (px from plot-left to axis zero) */
+      var px=clientX-r.left-xa._offset;
+      var val=xa.p2d(px);
+      /* val is a date string ("2024-01-15 ...") or a number (timestamp ms) */
+      if(typeof val==='number') return new Date(val).toISOString().substring(0,10);
+      return String(val).substring(0,10);
+    }catch(e){ return null; }
+  }
+
+  /* ── DOM tooltip ── */
   function getTip(src){
     if(tipMap.has(src)) return tipMap.get(src);
     var d=window.parent.document.createElement('div');
@@ -723,17 +732,15 @@ if ticker:
     if(tipMap.has(src)) tipMap.get(src).style.display='none';
   }
 
-  /* Issue a relayout for shapes without triggering our selection handler */
   function shapeRelayout(P,src,shapes){
     selfRelayout.add(src);
     try{ P.relayout(src,{'shapes':shapes}); }catch(e){}
-    // plotly_relayout fires synchronously inside P.relayout,
-    // so clear the flag right after (setTimeout 0 is a safety net)
     setTimeout(function(){ selfRelayout.delete(src); },0);
   }
 
-  /* ── Main selection handler ── */
+  /* ── Main handler ── */
   function handleSel(P,src,rawX0,rawX1){
+    if(!rawX0||!rawX1) return;
     var x0=toDateStr(rawX0), x1=toDateStr(rawX1);
     if(new Date(x0)>new Date(x1)){ var t=x0; x0=x1; x1=t; }
     if(new Date(x1)-new Date(x0)<86400000) return;
@@ -767,22 +774,60 @@ if ticker:
       type:'line',xref:'x',yref:'paper',x0:xv,x1:xv,y0:0,y1:1,
       line:{color:'rgba(180,180,200,.7)',width:1.5,dash:'dot'},layer:'above'
     };};
-    var base=origShapes.get(src)||[];
-    shapeRelayout(P,src,base.concat([vline(p0.x),vline(p1.x)]));
+    shapeRelayout(P,src,(origShapes.get(src)||[]).concat([vline(p0.x),vline(p1.x)]));
+  }
+
+  /* ── Single document-level mouseup (capture phase) ─────────────────────────
+     Plotly's internal drag layer consumes mouseup on the element itself, so
+     we listen at the document level with capture=true to fire before Plotly.
+     activeDrag is set on mousedown and cleared here. */
+  function ensureDocListener(){
+    if(docListenerAdded) return;
+    docListenerAdded=true;
+    window.parent.document.addEventListener('mouseup',function(e){
+      if(e.button!==0||!activeDrag) return;
+      var drag=activeDrag; activeDrag=null;
+      var dx=Math.abs(e.clientX-drag.x0client);
+      if(dx<8) return;
+      var endX=e.clientX;
+
+      setTimeout(function(){
+        /* Method 1: layout.selections (populated by Plotly newselection API) */
+        try{
+          var sels=drag.src.layout&&drag.src.layout.selections;
+          if(sels&&sels.length&&sels[0].x0!==undefined){
+            handleSel(drag.P,drag.src,sels[0].x0,sels[0].x1); return;
+          }
+        }catch(err){}
+
+        /* Method 2: convert raw pixel coordinates via Plotly axis internals */
+        try{
+          var xa=drag.P.x0,xb=endX;
+          var d0=clientXToDate(drag.src,drag.x0client);
+          var d1=clientXToDate(drag.src,endX);
+          if(d0&&d1) handleSel(drag.P,drag.src,d0,d1);
+        }catch(err){}
+      },150);
+    },true);
   }
 
   function setup(){
     var P=window.parent.Plotly;
     if(!P) return;
+    ensureDocListener();
     var charts=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
     charts.forEach(function(src){
       if(attached.has(src)) return;
       attached.add(src);
 
       try{
-        var sh=(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[];
-        origShapes.set(src,sh);
+        origShapes.set(src,(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[]);
       }catch(e){ origShapes.set(src,[]); }
+
+      /* track drag start for document-level mouseup */
+      src.addEventListener('mousedown',function(e){
+        if(e.button===0) activeDrag={src:src,P:P,x0client:e.clientX};
+      });
 
       /* ── crosshair sync ── */
       src.on('plotly_hover',function(d){
@@ -800,28 +845,13 @@ if ticker:
         });
       });
 
-      /* ── drag measure ──────────────────────────────────────────────────
-         Two complementary detection methods so it works across all
-         Plotly.js / Streamlit versions:
-
-         A) plotly_relayout — fires with "selections[0].x0" keys when the
-            newselection API is active (Plotly 2.6+, modern Streamlit).
-
-         B) mouseup fallback — after ANY drag release on the chart, read
-            src.layout.selections directly (100 ms after mouseup gives
-            Plotly time to update the layout object). Works even if the
-            relayout event doesn't carry selection keys.
-      ── */
-
-      /* A) plotly_relayout */
+      /* ── plotly_relayout (newselection API, Plotly 2.6+) ── */
       src.on('plotly_relayout',function(ed){
         if(selfRelayout.has(src)) return;
-        var keys=Object.keys(ed);
-        var isSel=keys.some(function(k){
+        var isSel=Object.keys(ed).some(function(k){
           return k==='selections'||k.startsWith('selections[');
         });
         if(!isSel) return;
-
         var x0,x1;
         if(Array.isArray(ed.selections)&&ed.selections.length){
           x0=ed.selections[0].x0; x1=ed.selections[0].x1;
@@ -835,26 +865,6 @@ if ticker:
         handleSel(P,src,x0,x1);
       });
 
-      /* B) mouseup fallback */
-      var dragOriginX=null;
-      src.addEventListener('mousedown',function(e){
-        if(e.button===0) dragOriginX=e.clientX;
-      });
-      src.addEventListener('mouseup',function(e){
-        if(e.button!==0||dragOriginX===null) return;
-        var dx=Math.abs(e.clientX-dragOriginX); dragOriginX=null;
-        if(dx<8) return; /* click, not drag */
-        setTimeout(function(){
-          try{
-            var sels=src.layout&&src.layout.selections;
-            if(sels&&sels.length&&sels[0].x0!==undefined){
-              handleSel(P,src,sels[0].x0,sels[0].x1);
-            }
-          }catch(err){}
-        },120);
-      });
-
-      /* clear on double-click */
       src.on('plotly_doubleclick',function(){
         hideTip(src);
         shapeRelayout(P,src,origShapes.get(src)||[]);
