@@ -793,6 +793,28 @@ if ticker:
     ov.tip.style.display='block';
   }
 
+  /* mousedown — CAPTURE PHASE on document so we fire before Plotly's
+     stopPropagation on .nsewdrag (which blocks bubble-phase listeners on src) */
+  window.parent.document.addEventListener('mousedown',function(e){
+    if(e.button!==0) return;
+    charts().forEach(function(src){
+      var title=''; try{title=src.layout.title.text||'';}catch(ex){}
+      if(!title.includes('Price Chart')||!src.contains(e.target)) return;
+      var d=pixelToDate(src,e.clientX); if(!d) return;
+      var pt=snapNearest(src,d); if(!pt) return;
+      hideOverlay(src);
+      dragStart.set(src,{clientX:e.clientX,snapPt:pt});
+    });
+  },true); // true = capture phase
+
+  window.parent.document.addEventListener('dblclick',function(e){
+    charts().forEach(function(src){
+      var title=''; try{title=src.layout.title.text||'';}catch(ex){}
+      if(!title.includes('Price Chart')||!src.contains(e.target)) return;
+      dragStart.delete(src); hideOverlay(src);
+    });
+  },true);
+
   /* mousemove — update overlay in real time (throttled via rAF) */
   var raf=null,lastX=0;
   window.parent.document.addEventListener('mousemove',function(e){
@@ -825,19 +847,6 @@ if ticker:
       var title=''; try{title=src.layout.title.text||'';}catch(e){}
       if(!title) return; // not ready yet
       attached.add(src);
-      /* price chart: drag-to-measure */
-      if(title.includes('Price Chart')){
-        src.addEventListener('mousedown',function(e){
-          if(e.button!==0) return;
-          var d=pixelToDate(src,e.clientX); if(!d) return;
-          var pt=snapNearest(src,d); if(!pt) return;
-          hideOverlay(src);
-          dragStart.set(src,{clientX:e.clientX,snapPt:pt});
-        });
-        src.addEventListener('dblclick',function(){
-          dragStart.delete(src); hideOverlay(src);
-        });
-      }
       /* crosshair sync for all charts */
       src.on('plotly_hover',function(d){
         if(!d.points||!d.points[0]) return;
