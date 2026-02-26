@@ -643,14 +643,18 @@ if ticker:
     )
 
     # ── Crosshair sync + snap-to-point drag measure ───────────────────────────
-    # Tooltip is a fixed-position DOM div appended to parent body.
-    # Cleared on double-click only (plotly_deselect fires as a side-effect of
-    # P.relayout and would immediately hide the tooltip, so we ignore it).
+    # Root-cause fix: Plotly's `newselection` API (which draws the blue box) does
+    # NOT fire `plotly_selected`. Instead it fires `plotly_relayout` with keys like
+    # "selections[0].x0" whenever the selection changes. We listen for those.
+    # To avoid a relayout loop (our own shape-update relayout re-triggering the
+    # selection handler) we set a per-chart flag via `selfRelayout` while calling
+    # P.relayout for shapes, and skip the handler while that flag is set.
     st.components.v1.html("""<script>
 (function(){
-  var attached   = new WeakSet();
-  var origShapes = new WeakMap();
-  var tipMap     = new WeakMap();   // chart → fixed-position tooltip div
+  var attached    = new WeakSet();
+  var origShapes  = new WeakMap();
+  var tipMap      = new WeakMap();
+  var selfRelayout = new WeakSet(); // set while we're issuing a shape relayout
 
   /* ── helpers ── */
   function toDateStr(v){
@@ -675,7 +679,7 @@ if ticker:
     try{ return (chart.layout.title.text||'').includes('Price Chart'); }
     catch(e){ return false; }
   }
-  function snapNearest(tr, targetDate){
+  function snapNearest(tr,targetDate){
     var best=null, bestDiff=Infinity;
     var td=new Date(targetDate).getTime();
     for(var j=0;j<tr.x.length;j++){
@@ -688,7 +692,7 @@ if ticker:
     return best;
   }
 
-  /* ── DOM tooltip (appended to parent body, fixed-position) ── */
+  /* ── DOM tooltip (fixed-position div in parent body) ── */
   function getTip(src){
     if(tipMap.has(src)) return tipMap.get(src);
     var d=window.parent.document.createElement('div');
@@ -709,13 +713,9 @@ if ticker:
     tip.innerHTML=html;
     tip.style.display='block';
     try{
-      // src is in the parent document, so getBoundingClientRect() already
-      // returns parent-viewport coordinates — do NOT add frameElement offsets
-      // (the height=0 iframe sits at the bottom of the page, so fr.top would
-      //  be ~2000px and push the tooltip far off-screen)
       var sr=src.getBoundingClientRect();
-      tip.style.left =(sr.left+sr.width/2)+'px';
-      tip.style.top  =(sr.top+12)+'px';
+      tip.style.left=(sr.left+sr.width/2)+'px';
+      tip.style.top=(sr.top+12)+'px';
       tip.style.transform='translateX(-50%)';
     }catch(e){}
   }
@@ -723,6 +723,53 @@ if ticker:
     if(tipMap.has(src)) tipMap.get(src).style.display='none';
   }
 
+  /* Issue a relayout for shapes without triggering our selection handler */
+  function shapeRelayout(P,src,shapes){
+    selfRelayout.add(src);
+    try{ P.relayout(src,{'shapes':shapes}); }catch(e){}
+    // plotly_relayout fires synchronously inside P.relayout,
+    // so clear the flag right after (setTimeout 0 is a safety net)
+    setTimeout(function(){ selfRelayout.delete(src); },0);
+  }
+
+  /* ── Main selection handler ── */
+  function handleSel(P,src,rawX0,rawX1){
+    var x0=toDateStr(rawX0), x1=toDateStr(rawX1);
+    if(new Date(x0)>new Date(x1)){ var t=x0; x0=x1; x1=t; }
+    if(new Date(x1)-new Date(x0)<86400000) return;
+
+    var tr=getMainTrace(src);
+    if(!tr) return;
+
+    var p0=snapNearest(tr,x0), p1=snapNearest(tr,x1);
+    if(!p0||!p1||p0.x===p1.x) return;
+    if(new Date(p0.x)>new Date(p1.x)){ var t=p0; p0=p1; p1=t; }
+
+    var sy=p0.y, ey=p1.y, txt, color, arrow;
+    if(isPriceChart(src)){
+      var dp=ey-sy, pct=((ey/sy)-1)*100;
+      arrow=dp>=0?'▲':'▼'; color=dp>=0?'#10b981':'#ef4444';
+      txt='<b>'+(dp>=0?'+':'-')+'$'+Math.abs(dp).toFixed(2)
+         +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '+arrow+'</b>'
+         +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
+         +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
+    } else {
+      var dpp=(ey-sy)*100;
+      arrow=dpp>=0?'▲':'▼'; color=dpp>=0?'#10b981':'#ef4444';
+      txt='<b>'+(dpp>=0?'+':'')+dpp.toFixed(1)+' pp '+arrow+'</b>'
+         +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
+         +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
+    }
+
+    showTip(src,txt,color);
+
+    var vline=function(xv){ return {
+      type:'line',xref:'x',yref:'paper',x0:xv,x1:xv,y0:0,y1:1,
+      line:{color:'rgba(180,180,200,.7)',width:1.5,dash:'dot'},layer:'above'
+    };};
+    var base=origShapes.get(src)||[];
+    shapeRelayout(P,src,base.concat([vline(p0.x),vline(p1.x)]));
+  }
 
   function setup(){
     var P=window.parent.Plotly;
@@ -732,7 +779,6 @@ if ticker:
       if(attached.has(src)) return;
       attached.add(src);
 
-      /* snapshot original shapes */
       try{
         var sh=(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[];
         origShapes.set(src,sh);
@@ -754,57 +800,44 @@ if ticker:
         });
       });
 
-      /* ── snap-to-point drag measure ── */
-      src.on('plotly_selected',function(ed){
-        if(!ed||!ed.range||!ed.range.x) return;
-        var x0=toDateStr(ed.range.x[0]);
-        var x1=toDateStr(ed.range.x[1]);
-        if(new Date(x1)-new Date(x0)<86400000) return;
+      /* ── drag measure via plotly_relayout (newselection API) ──
+         With `newselection` in the layout, Plotly fires plotly_relayout
+         (not plotly_selected) when the user draws/modifies a selection box.
+         The event data contains keys like "selections[0].x0". */
+      src.on('plotly_relayout',function(ed){
+        /* skip relayouts we issued ourselves for shape updates */
+        if(selfRelayout.has(src)) return;
 
-        var tr=getMainTrace(src);
-        if(!tr) return;
+        /* check if this is a selection-related event */
+        var keys=Object.keys(ed);
+        var isSel=keys.some(function(k){
+          return k==='selections'||k.startsWith('selections[');
+        });
+        if(!isSel) return;
 
-        var p0=snapNearest(tr,x0);
-        var p1=snapNearest(tr,x1);
-        if(!p0||!p1||p0.x===p1.x) return;
-        if(new Date(p0.x)>new Date(p1.x)){ var tmp=p0; p0=p1; p1=tmp; }
-
-        var sy=p0.y, ey=p1.y, txt, color, arrow;
-        if(isPriceChart(src)){
-          var dp=ey-sy, pct=((ey/sy)-1)*100;
-          arrow=dp>=0?'▲':'▼'; color=dp>=0?'#10b981':'#ef4444';
-          txt='<b>'+(dp>=0?'+':'-')+'$'+Math.abs(dp).toFixed(2)
-             +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '+arrow+'</b>'
-             +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
-             +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
+        /* read selection bounds — prefer event data, fall back to layout */
+        var x0, x1;
+        if(Array.isArray(ed.selections)&&ed.selections.length){
+          x0=ed.selections[0].x0; x1=ed.selections[0].x1;
         } else {
-          var dpp=(ey-sy)*100;
-          arrow=dpp>=0?'▲':'▼'; color=dpp>=0?'#10b981':'#ef4444';
-          txt='<b>'+(dpp>=0?'+':'')+dpp.toFixed(1)+' pp '+arrow+'</b>'
-             +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
-             +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
+          var sels=src.layout&&src.layout.selections;
+          if(sels&&sels.length){ x0=sels[0].x0; x1=sels[0].x1; }
         }
 
-        /* show tooltip first — independent of shapes relayout */
-        showTip(src,txt,color);
+        if(x0===undefined||x1===undefined){
+          /* selection cleared */
+          hideTip(src);
+          shapeRelayout(P,src,origShapes.get(src)||[]);
+          return;
+        }
 
-        /* draw vertical lines (best-effort; failure won't hide tooltip) */
-        var vline=function(xv){ return {
-          type:'line',xref:'x',yref:'paper',
-          x0:xv,x1:xv,y0:0,y1:1,
-          line:{color:'rgba(180,180,200,.7)',width:1.5,dash:'dot'},
-          layer:'above'
-        };};
-        var base=origShapes.get(src)||[];
-        try{ P.relayout(src,{'shapes':base.concat([vline(p0.x),vline(p1.x)])}); }catch(e){}
+        handleSel(P,src,x0,x1);
       });
 
-      /* clear on explicit double-click only — NOT on plotly_deselect, which
-         fires as a side-effect of P.relayout() and would immediately hide the tip */
+      /* also handle clear on double-click */
       src.on('plotly_doubleclick',function(){
         hideTip(src);
-        var base=origShapes.get(src)||[];
-        try{ P.relayout(src,{'shapes':base}); }catch(e){}
+        shapeRelayout(P,src,origShapes.get(src)||[]);
       });
     });
   }
