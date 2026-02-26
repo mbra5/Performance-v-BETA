@@ -451,16 +451,15 @@ if ticker:
         st.error(f"Could not load data for **{ticker}**: {error or 'empty response'}")
         st.stop()
 
-    # Trim burn-in rows (12W needs 60 days before first valid value)
+    # Trim burn-in rows; detect if beta metrics are computable
     df_plot = df.dropna(subset=["perf_vs_beta_12W", "perf_vs_beta_4W", "perf_vs_beta_2W"]).copy()
-
-    if df_plot.empty:
-        st.error(
-            f"Not enough price history for **{ticker}** to compute rolling metrics. "
-            f"At least ~6 months of data is required (for the beta window). "
-            f"The ticker may be too recently listed or may not exist."
-        )
-        st.stop()
+    beta_ok = not df_plot.empty
+    if not beta_ok:
+        # Not enough history for beta — fall back to raw price data only
+        df_plot = df.dropna(subset=["stock_price"]).copy()
+        if df_plot.empty:
+            st.error(f"No price data available for **{ticker}**.")
+            st.stop()
 
     # ── Palette ───────────────────────────────────────────────────────────────
     ACCENT  = "#3b82f6"
@@ -644,9 +643,30 @@ if ticker:
         fig.update_yaxes(tickformat=".1%", **_ax)
         return fig
 
-    fig_12w = make_perf_fig("perf_vs_beta_12W", ACCENT, "12 Week")
-    fig_4w  = make_perf_fig("perf_vs_beta_4W",  PURPLE, "4 Week")
-    fig_2w  = make_perf_fig("perf_vs_beta_2W",  AMBER,  "2 Week")
+    if beta_ok:
+        fig_12w = make_perf_fig("perf_vs_beta_12W", ACCENT, "12 Week")
+        fig_4w  = make_perf_fig("perf_vs_beta_4W",  PURPLE, "4 Week")
+        fig_2w  = make_perf_fig("perf_vs_beta_2W",  AMBER,  "2 Week")
+    else:
+        def _no_beta_fig(label):
+            _f = go.Figure()
+            _f.add_annotation(
+                text="Not enough history to compute beta metrics<br>"
+                     "<span style='font-size:11px;opacity:.7'>"
+                     "Requires ~6 months of price data</span>",
+                xref="paper", yref="paper", x=0.5, y=0.5,
+                showarrow=False,
+                font=dict(size=13, color="#94a3b8", family="Inter, sans-serif"),
+                align="center",
+            )
+            _f.update_layout(**_base_layout(
+                f"Perf vs. Beta — {label}  ({ticker} vs {index_key})"
+            ))
+            _f.update_layout(paper_bgcolor="#f1f5f9", plot_bgcolor="#f1f5f9")
+            return _f
+        fig_12w = _no_beta_fig("12 Week")
+        fig_4w  = _no_beta_fig("4 Week")
+        fig_2w  = _no_beta_fig("2 Week")
 
     # ── 2×2 grid: TL=Price, TR=12W, BL=4W, BR=2W ─────────────────────────────
     col_left, col_right = st.columns(2, gap="small")
@@ -674,26 +694,161 @@ if ticker:
         unsafe_allow_html=True,
     )
 
-    # ── Crosshair sync ────────────────────────────────────────────────────────
+    # ── Crosshair sync + price-chart drag-to-measure ─────────────────────────
     st.components.v1.html("""<script>
 (function(){
-  var attached=new WeakSet();
+  var attached  =new WeakSet();
+  var dragStart =new WeakMap(); // chart → {clientX, snapPt}
+  var overlayMap=new WeakMap(); // chart → {lineA,lineB,shade,tip}
+
+  function parseT(v){
+    if(typeof v==='number') return v;
+    return new Date(String(v).substring(0,10)+'T00:00:00Z').getTime();
+  }
+  function pixelToDate(src,clientX){
+    try{
+      var xa=src._fullLayout.xaxis;
+      var drag=src.querySelector('.nsewdrag'); if(!drag) return null;
+      var bb=drag.getBoundingClientRect();
+      var frac=Math.max(0,Math.min(1,(clientX-bb.left)/bb.width));
+      var t0=parseT(xa.range[0]),t1=parseT(xa.range[1]);
+      return new Date(t0+frac*(t1-t0)).toISOString().substring(0,10);
+    }catch(e){return null;}
+  }
+  function dateToClientX(src,dateStr){
+    try{
+      var xa=src._fullLayout.xaxis;
+      var drag=src.querySelector('.nsewdrag'); if(!drag) return null;
+      var bb=drag.getBoundingClientRect();
+      var t0=parseT(xa.range[0]),t1=parseT(xa.range[1]);
+      var tD=new Date(dateStr+'T00:00:00Z').getTime();
+      return bb.left+((tD-t0)/(t1-t0))*bb.width;
+    }catch(e){return null;}
+  }
+  function snapNearest(src,dateStr){
+    try{
+      var td=new Date(dateStr+'T00:00:00Z').getTime();
+      var best=null,bestDiff=Infinity;
+      (src.data||[]).forEach(function(tr){
+        if(!tr.x||tr.x.length<=1) return;
+        if(tr.mode==='markers') return;
+        if(tr.line&&Number(tr.line.width)===0) return;
+        for(var j=0;j<tr.x.length;j++){
+          var yv=parseFloat(tr.y[j]); if(!Number.isFinite(yv)) continue;
+          var xd=String(tr.x[j]).substring(0,10);
+          var diff=Math.abs(new Date(xd+'T00:00:00Z').getTime()-td);
+          if(diff<bestDiff){bestDiff=diff;best={x:xd,y:yv};}
+        }
+      });
+      return best;
+    }catch(e){return null;}
+  }
+  function fmtDate(s){
+    return new Date(s+'T00:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+  }
+
+  function charts(){return [...window.parent.document.querySelectorAll('.js-plotly-plot')];}
+  function getOverlay(src){
+    if(overlayMap.has(src)) return overlayMap.get(src);
+    var B=window.parent.document.body;
+    function mk(css){var d=window.parent.document.createElement('div');d.style.cssText=css+'display:none;';B.appendChild(d);return d;}
+    var ov={
+      lineA:mk('position:fixed;width:1px;pointer-events:none;z-index:9998;background:rgba(80,80,120,.5);'),
+      lineB:mk('position:fixed;width:1px;pointer-events:none;z-index:9998;background:rgba(80,80,120,.5);'),
+      shade:mk('position:fixed;pointer-events:none;z-index:9997;background:rgba(110,120,230,.07);'),
+      tip:  mk('position:fixed;pointer-events:none;z-index:99999;padding:5px 14px;border-radius:8px;'
+               +'font:bold 13px/1.5 Inter,sans-serif;white-space:nowrap;color:#fff;'
+               +'box-shadow:0 2px 12px rgba(0,0,0,.35);transform:translateX(-50%);text-align:center;'),
+    };
+    overlayMap.set(src,ov); return ov;
+  }
+  function hideOverlay(src){
+    if(!overlayMap.has(src)) return;
+    var o=overlayMap.get(src);
+    ['lineA','lineB','shade','tip'].forEach(function(k){o[k].style.display='none';});
+  }
+  function showOverlay(src,ptA,ptB){
+    if(ptA.x===ptB.x) return;
+    var ov=getOverlay(src);
+    var drag=src.querySelector('.nsewdrag'); if(!drag) return;
+    var bb=drag.getBoundingClientRect();
+    var xA=dateToClientX(src,ptA.x),xB=dateToClientX(src,ptB.x);
+    if(xA===null||xB===null) return;
+    function posLine(el,x){el.style.left=x+'px';el.style.top=bb.top+'px';el.style.height=bb.height+'px';el.style.display='block';}
+    posLine(ov.lineA,xA); posLine(ov.lineB,xB);
+    var lo=Math.min(xA,xB),hi=Math.max(xA,xB);
+    ov.shade.style.left=lo+'px'; ov.shade.style.top=bb.top+'px';
+    ov.shade.style.width=(hi-lo)+'px'; ov.shade.style.height=bb.height+'px';
+    ov.shade.style.display='block';
+    var first=ptA.x<ptB.x?ptA:ptB, last=ptA.x<ptB.x?ptB:ptA;
+    var dy=last.y-first.y, pct=((last.y/first.y)-1)*100;
+    var up=dy>=0, color=up?'#10b981':'#ef4444', arrow=up?'▲':'▼';
+    ov.tip.style.background=color;
+    ov.tip.innerHTML='<span style="font-size:14px">'+(up?'+':'\u2212')+'$'+Math.abs(dy).toFixed(2)
+      +' ('+(up?'+':'')+pct.toFixed(1)+'%) '+arrow+'</span>'
+      +'<br><span style="font-weight:400;font-size:10px;opacity:.85">'
+      +fmtDate(first.x)+' \u2192 '+fmtDate(last.x)+'</span>';
+    ov.tip.style.left=((lo+hi)/2)+'px';
+    ov.tip.style.top=(bb.top+8)+'px';
+    ov.tip.style.display='block';
+  }
+
+  /* mousemove — update overlay in real time (throttled via rAF) */
+  var raf=null,lastX=0;
+  window.parent.document.addEventListener('mousemove',function(e){
+    lastX=e.clientX;
+    if(raf) return;
+    raf=window.parent.requestAnimationFrame(function(){
+      raf=null;
+      charts().forEach(function(src){
+        var s=dragStart.get(src); if(!s) return;
+        var d=pixelToDate(src,lastX); if(!d) return;
+        var pt=snapNearest(src,d);
+        if(pt&&pt.x!==s.snapPt.x) showOverlay(src,s.snapPt,pt);
+      });
+    });
+  });
+  /* mouseup — keep overlay visible; clear on single click */
+  window.parent.document.addEventListener('mouseup',function(e){
+    if(e.button!==0) return;
+    charts().forEach(function(src){
+      var s=dragStart.get(src); if(!s) return;
+      dragStart.delete(src);
+      if(Math.abs(e.clientX-s.clientX)<5) hideOverlay(src);
+    });
+  });
+
   function setup(){
-    var P=window.parent.Plotly;
-    if(!P) return;
-    [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(src){
+    var P=window.parent.Plotly; if(!P) return;
+    charts().forEach(function(src){
       if(attached.has(src)) return;
+      var title=''; try{title=src.layout.title.text||'';}catch(e){}
+      if(!title) return; // not ready yet
       attached.add(src);
+      /* price chart: drag-to-measure */
+      if(title.includes('Price Chart')){
+        src.addEventListener('mousedown',function(e){
+          if(e.button!==0) return;
+          var d=pixelToDate(src,e.clientX); if(!d) return;
+          var pt=snapNearest(src,d); if(!pt) return;
+          hideOverlay(src);
+          dragStart.set(src,{clientX:e.clientX,snapPt:pt});
+        });
+        src.addEventListener('dblclick',function(){
+          dragStart.delete(src); hideOverlay(src);
+        });
+      }
+      /* crosshair sync for all charts */
       src.on('plotly_hover',function(d){
         if(!d.points||!d.points[0]) return;
         var xv=d.points[0].x;
-        [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(dst){
-          if(dst!==src) try{P.Fx.hover(dst,[{xval:xv}],'');}catch(e){}
+        charts().forEach(function(dst){
+          if(dst!==src) try{P.Fx.hover(dst,[{xval:xv}],'');}catch(ex){}
         });
       });
       src.on('plotly_unhover',function(){
-        [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(dst){
-          if(dst!==src) try{P.Fx.hover(dst,[],'');}catch(e){}
+        charts().forEach(function(dst){
+          if(dst!==src) try{P.Fx.hover(dst,[],'');}catch(ex){}
         });
       });
     });
