@@ -800,41 +800,61 @@ if ticker:
         });
       });
 
-      /* ── drag measure via plotly_relayout (newselection API) ──
-         With `newselection` in the layout, Plotly fires plotly_relayout
-         (not plotly_selected) when the user draws/modifies a selection box.
-         The event data contains keys like "selections[0].x0". */
-      src.on('plotly_relayout',function(ed){
-        /* skip relayouts we issued ourselves for shape updates */
-        if(selfRelayout.has(src)) return;
+      /* ── drag measure ──────────────────────────────────────────────────
+         Two complementary detection methods so it works across all
+         Plotly.js / Streamlit versions:
 
-        /* check if this is a selection-related event */
+         A) plotly_relayout — fires with "selections[0].x0" keys when the
+            newselection API is active (Plotly 2.6+, modern Streamlit).
+
+         B) mouseup fallback — after ANY drag release on the chart, read
+            src.layout.selections directly (100 ms after mouseup gives
+            Plotly time to update the layout object). Works even if the
+            relayout event doesn't carry selection keys.
+      ── */
+
+      /* A) plotly_relayout */
+      src.on('plotly_relayout',function(ed){
+        if(selfRelayout.has(src)) return;
         var keys=Object.keys(ed);
         var isSel=keys.some(function(k){
           return k==='selections'||k.startsWith('selections[');
         });
         if(!isSel) return;
 
-        /* read selection bounds — prefer event data, fall back to layout */
-        var x0, x1;
+        var x0,x1;
         if(Array.isArray(ed.selections)&&ed.selections.length){
           x0=ed.selections[0].x0; x1=ed.selections[0].x1;
         } else {
           var sels=src.layout&&src.layout.selections;
           if(sels&&sels.length){ x0=sels[0].x0; x1=sels[0].x1; }
         }
-
         if(x0===undefined||x1===undefined){
-          /* selection cleared */
-          hideTip(src);
-          shapeRelayout(P,src,origShapes.get(src)||[]);
-          return;
+          hideTip(src); shapeRelayout(P,src,origShapes.get(src)||[]); return;
         }
-
         handleSel(P,src,x0,x1);
       });
 
-      /* also handle clear on double-click */
+      /* B) mouseup fallback */
+      var dragOriginX=null;
+      src.addEventListener('mousedown',function(e){
+        if(e.button===0) dragOriginX=e.clientX;
+      });
+      src.addEventListener('mouseup',function(e){
+        if(e.button!==0||dragOriginX===null) return;
+        var dx=Math.abs(e.clientX-dragOriginX); dragOriginX=null;
+        if(dx<8) return; /* click, not drag */
+        setTimeout(function(){
+          try{
+            var sels=src.layout&&src.layout.selections;
+            if(sels&&sels.length&&sels[0].x0!==undefined){
+              handleSel(P,src,sels[0].x0,sels[0].x1);
+            }
+          }catch(err){}
+        },120);
+      });
+
+      /* clear on double-click */
       src.on('plotly_doubleclick',function(){
         hideTip(src);
         shapeRelayout(P,src,origShapes.get(src)||[]);
