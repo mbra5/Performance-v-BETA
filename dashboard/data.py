@@ -9,6 +9,7 @@ Logic mirrors the Excel model:
   Computed for three windows: 2W (10 days), 4W (20 days), 12W (60 days)
 """
 
+import os
 import re
 import warnings
 import numpy as np
