@@ -271,8 +271,12 @@ def _search(q: str):
 
 @st.cache_data(ttl=3600)
 def _load(ticker, index_key, period, custom_start=None, custom_end=None):
-    return load_data(ticker, index_key=index_key, period=period,
-                     start_date=custom_start, end_date=custom_end)
+    df, error = load_data(ticker, index_key=index_key, period=period,
+                          start_date=custom_start, end_date=custom_end)
+    if error or df.empty:
+        # Raise so st.cache_data does NOT cache failures (only successes)
+        raise RuntimeError(error or "empty response")
+    return df, ""
 
 @st.cache_data(ttl=86400)
 def _company(ticker):
@@ -433,7 +437,10 @@ st.divider()
 # ── Load & render ─────────────────────────────────────────────────────────────
 if ticker:
     with st.spinner(f"Loading {ticker}…"):
-        df, error    = _load(ticker, index_key, period, custom_start, custom_end)
+        try:
+            df, error = _load(ticker, index_key, period, custom_start, custom_end)
+        except RuntimeError as _e:
+            df, error = pd.DataFrame(), str(_e)
         company_name = _company(ticker)
 
     if error or df.empty:
