@@ -643,16 +643,14 @@ if ticker:
     )
 
     # ── Crosshair sync + snap-to-point drag measure ───────────────────────────
-    # Tooltip uses a fixed-position DOM div (reliable across iframes).
-    # P.relayout is used only for the two dashed vertical lines (shapes).
-    # 'blocking' WeakSet prevents plotly_deselect from clearing immediately
-    # after plotly_selected fires and calls relayout (race condition).
+    # Tooltip is a fixed-position DOM div appended to parent body.
+    # Cleared on double-click only (plotly_deselect fires as a side-effect of
+    # P.relayout and would immediately hide the tooltip, so we ignore it).
     st.components.v1.html("""<script>
 (function(){
   var attached   = new WeakSet();
   var origShapes = new WeakMap();
   var tipMap     = new WeakMap();   // chart → fixed-position tooltip div
-  var blocking   = new WeakSet();   // suppress clearDelta during relayout
 
   /* ── helpers ── */
   function toDateStr(v){
@@ -725,12 +723,6 @@ if ticker:
     if(tipMap.has(src)) tipMap.get(src).style.display='none';
   }
 
-  function clearDelta(P, src){
-    if(blocking.has(src)) return;
-    hideTip(src);
-    var base=origShapes.get(src)||[];
-    try{ P.relayout(src,{'shapes':base}); }catch(e){}
-  }
 
   function setup(){
     var P=window.parent.Plotly;
@@ -764,17 +756,17 @@ if ticker:
 
       /* ── snap-to-point drag measure ── */
       src.on('plotly_selected',function(ed){
-        if(!ed||!ed.range||!ed.range.x){ clearDelta(P,src); return; }
+        if(!ed||!ed.range||!ed.range.x) return;
         var x0=toDateStr(ed.range.x[0]);
         var x1=toDateStr(ed.range.x[1]);
-        if(new Date(x1)-new Date(x0)<86400000){ clearDelta(P,src); return; }
+        if(new Date(x1)-new Date(x0)<86400000) return;
 
         var tr=getMainTrace(src);
-        if(!tr){ clearDelta(P,src); return; }
+        if(!tr) return;
 
         var p0=snapNearest(tr,x0);
         var p1=snapNearest(tr,x1);
-        if(!p0||!p1||p0.x===p1.x){ clearDelta(P,src); return; }
+        if(!p0||!p1||p0.x===p1.x) return;
         if(new Date(p0.x)>new Date(p1.x)){ var tmp=p0; p0=p1; p1=tmp; }
 
         var sy=p0.y, ey=p1.y, txt, color, arrow;
@@ -793,7 +785,10 @@ if ticker:
              +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
         }
 
-        /* two dashed vertical lines via relayout shapes */
+        /* show tooltip first — independent of shapes relayout */
+        showTip(src,txt,color);
+
+        /* draw vertical lines (best-effort; failure won't hide tooltip) */
         var vline=function(xv){ return {
           type:'line',xref:'x',yref:'paper',
           x0:xv,x1:xv,y0:0,y1:1,
@@ -801,15 +796,16 @@ if ticker:
           layer:'above'
         };};
         var base=origShapes.get(src)||[];
-
-        /* block clearDelta during relayout to avoid race with plotly_deselect */
-        blocking.add(src);
         try{ P.relayout(src,{'shapes':base.concat([vline(p0.x),vline(p1.x)])}); }catch(e){}
-        showTip(src,txt,color);
-        setTimeout(function(){ blocking.delete(src); },400);
       });
 
-      src.on('plotly_deselect',function(){ clearDelta(P,src); });
+      /* clear on explicit double-click only — NOT on plotly_deselect, which
+         fires as a side-effect of P.relayout() and would immediately hide the tip */
+      src.on('plotly_doubleclick',function(){
+        hideTip(src);
+        var base=origShapes.get(src)||[];
+        try{ P.relayout(src,{'shapes':base}); }catch(e){}
+      });
     });
   }
 
