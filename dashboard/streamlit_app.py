@@ -711,10 +711,13 @@ if ticker:
     tip.innerHTML=html;
     tip.style.display='block';
     try{
-      var sr=src.getBoundingClientRect();          // coords in child iframe
-      var fr=window.frameElement.getBoundingClientRect(); // iframe in parent
-      tip.style.left =(fr.left+sr.left+sr.width/2)+'px';
-      tip.style.top  =(fr.top +sr.top +12)+'px';
+      // src is in the parent document, so getBoundingClientRect() already
+      // returns parent-viewport coordinates — do NOT add frameElement offsets
+      // (the height=0 iframe sits at the bottom of the page, so fr.top would
+      //  be ~2000px and push the tooltip far off-screen)
+      var sr=src.getBoundingClientRect();
+      tip.style.left =(sr.left+sr.width/2)+'px';
+      tip.style.top  =(sr.top+12)+'px';
       tip.style.transform='translateX(-50%)';
     }catch(e){}
   }
