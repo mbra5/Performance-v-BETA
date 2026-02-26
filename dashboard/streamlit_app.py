@@ -665,17 +665,14 @@ if ticker:
         unsafe_allow_html=True,
     )
 
-    # ── Crosshair sync + snap-to-point drag measure ───────────────────────────
+    # ── Crosshair sync + drag-to-measure ─────────────────────────────────────
     st.components.v1.html("""<script>
 (function(){
   var attached     = new WeakSet();
   var origShapes   = new WeakMap();
   var tipMap       = new WeakMap();
   var selfRelayout = new WeakSet();
-  var activeDrag   = null;   // {src, P, x0client} — set on mousedown
-  var docListenerAdded = false;
 
-  /* ── helpers ── */
   function toDateStr(v){
     if(typeof v==='number') return new Date(v).toISOString().substring(0,10);
     return String(v).substring(0,10);
@@ -709,32 +706,12 @@ if ticker:
     }
     return best;
   }
-
-  /* Convert a clientX pixel to a date string using Plotly's axis internals */
-  function clientXToDate(src,clientX){
-    try{
-      var xa=src._fullLayout.xaxis;
-      var r=src.getBoundingClientRect();
-      /* xa._offset = left margin (px from plot-left to axis zero) */
-      var px=clientX-r.left-xa._offset;
-      var val=xa.p2d(px);
-      /* val is a date string ("2024-01-15 ...") or a number (timestamp ms) */
-      if(typeof val==='number') return new Date(val).toISOString().substring(0,10);
-      return String(val).substring(0,10);
-    }catch(e){ return null; }
-  }
-
-  /* ── DOM tooltip ── */
   function getTip(src){
     if(tipMap.has(src)) return tipMap.get(src);
     var d=window.parent.document.createElement('div');
-    d.style.cssText=[
-      'position:fixed','z-index:99999','pointer-events:none','display:none',
-      'padding:6px 12px','border-radius:6px',
-      'font:bold 12px/1.5 Inter,sans-serif',
-      'white-space:nowrap','color:#fff',
-      'box-shadow:0 2px 10px rgba(0,0,0,.45)'
-    ].join(';');
+    d.style.cssText='position:fixed;z-index:99999;pointer-events:none;display:none;'
+      +'padding:6px 12px;border-radius:6px;font:bold 12px/1.5 Inter,sans-serif;'
+      +'white-space:nowrap;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.45);';
     window.parent.document.body.appendChild(d);
     tipMap.set(src,d);
     return d;
@@ -754,134 +731,95 @@ if ticker:
   function hideTip(src){
     if(tipMap.has(src)) tipMap.get(src).style.display='none';
   }
-
   function shapeRelayout(P,src,shapes){
     selfRelayout.add(src);
     try{ P.relayout(src,{'shapes':shapes}); }catch(e){}
     setTimeout(function(){ selfRelayout.delete(src); },0);
   }
-
-  /* ── Main handler ── */
   function handleSel(P,src,rawX0,rawX1){
     if(!rawX0||!rawX1) return;
-    var x0=toDateStr(rawX0), x1=toDateStr(rawX1);
-    if(new Date(x0)>new Date(x1)){ var t=x0; x0=x1; x1=t; }
+    var x0=toDateStr(rawX0),x1=toDateStr(rawX1);
+    if(new Date(x0)>new Date(x1)){var tmp=x0;x0=x1;x1=tmp;}
     if(new Date(x1)-new Date(x0)<86400000) return;
-
     var tr=getMainTrace(src);
     if(!tr) return;
-
-    var p0=snapNearest(tr,x0), p1=snapNearest(tr,x1);
+    var p0=snapNearest(tr,x0),p1=snapNearest(tr,x1);
     if(!p0||!p1||p0.x===p1.x) return;
-    if(new Date(p0.x)>new Date(p1.x)){ var t=p0; p0=p1; p1=t; }
-
-    var sy=p0.y, ey=p1.y, txt, color, arrow;
+    if(new Date(p0.x)>new Date(p1.x)){var tmp=p0;p0=p1;p1=tmp;}
+    var sy=p0.y,ey=p1.y,txt,color,arrow;
     if(isPriceChart(src)){
-      var dp=ey-sy, pct=((ey/sy)-1)*100;
+      var dp=ey-sy,pct=((ey/sy)-1)*100;
       arrow=dp>=0?'▲':'▼'; color=dp>=0?'#10b981':'#ef4444';
       txt='<b>'+(dp>=0?'+':'-')+'$'+Math.abs(dp).toFixed(2)
          +' ('+(dp>=0?'+':'')+pct.toFixed(1)+'%) '+arrow+'</b>'
          +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
          +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
-    } else {
+    }else{
       var dpp=(ey-sy)*100;
       arrow=dpp>=0?'▲':'▼'; color=dpp>=0?'#10b981':'#ef4444';
       txt='<b>'+(dpp>=0?'+':'')+dpp.toFixed(1)+' pp '+arrow+'</b>'
          +'<br><span style="font-weight:normal;font-size:10px;opacity:.85">'
          +fmtDate(p0.x)+' \u2013 '+fmtDate(p1.x)+'</span>';
     }
-
     showTip(src,txt,color);
-
-    var vline=function(xv){ return {
+    var vline=function(xv){return{
       type:'line',xref:'x',yref:'paper',x0:xv,x1:xv,y0:0,y1:1,
       line:{color:'rgba(180,180,200,.7)',width:1.5,dash:'dot'},layer:'above'
     };};
     shapeRelayout(P,src,(origShapes.get(src)||[]).concat([vline(p0.x),vline(p1.x)]));
   }
 
-  /* ── Single document-level mouseup (capture phase) ─────────────────────────
-     Plotly's internal drag layer consumes mouseup on the element itself, so
-     we listen at the document level with capture=true to fire before Plotly.
-     activeDrag is set on mousedown and cleared here. */
-  function ensureDocListener(){
-    if(docListenerAdded) return;
-    docListenerAdded=true;
-    window.parent.document.addEventListener('mouseup',function(e){
-      if(e.button!==0||!activeDrag) return;
-      var drag=activeDrag; activeDrag=null;
-      var dx=Math.abs(e.clientX-drag.x0client);
-      if(dx<8) return;
-      var endX=e.clientX;
-
-      setTimeout(function(){
-        /* Method 1: layout.selections (populated by Plotly newselection API) */
-        try{
-          var sels=drag.src.layout&&drag.src.layout.selections;
-          if(sels&&sels.length&&sels[0].x0!==undefined){
-            handleSel(drag.P,drag.src,sels[0].x0,sels[0].x1); return;
-          }
-        }catch(err){}
-
-        /* Method 2: convert raw pixel coordinates via Plotly axis internals */
-        try{
-          var xa=drag.P.x0,xb=endX;
-          var d0=clientXToDate(drag.src,drag.x0client);
-          var d1=clientXToDate(drag.src,endX);
-          if(d0&&d1) handleSel(drag.P,drag.src,d0,d1);
-        }catch(err){}
-      },150);
-    },true);
-  }
-
   function setup(){
     var P=window.parent.Plotly;
     if(!P) return;
-    ensureDocListener();
     var charts=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
     charts.forEach(function(src){
       if(attached.has(src)) return;
       attached.add(src);
-
       try{
         origShapes.set(src,(src.layout&&src.layout.shapes)?src.layout.shapes.slice():[]);
-      }catch(e){ origShapes.set(src,[]); }
+      }catch(e){origShapes.set(src,[]);}
 
-      /* track drag start for document-level mouseup */
-      src.addEventListener('mousedown',function(e){
-        if(e.button===0) activeDrag={src:src,P:P,x0client:e.clientX};
-      });
-
-      /* ── crosshair sync ── */
+      /* crosshair sync */
       src.on('plotly_hover',function(d){
         if(!d.points||!d.points[0]) return;
         var xv=d.points[0].x;
-        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
-        all.forEach(function(dst){
-          if(dst!==src) try{ P.Fx.hover(dst,[{xval:xv}],''); }catch(e){}
+        [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(dst){
+          if(dst!==src) try{P.Fx.hover(dst,[{xval:xv}],'');}catch(e){}
         });
       });
       src.on('plotly_unhover',function(){
-        var all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
-        all.forEach(function(dst){
-          if(dst!==src) try{ P.Fx.hover(dst,[],''); }catch(e){}
+        [...window.parent.document.querySelectorAll('.js-plotly-plot')].forEach(function(dst){
+          if(dst!==src) try{P.Fx.hover(dst,[],'');}catch(e){}
         });
       });
 
-      /* ── plotly_relayout (newselection API, Plotly 2.6+) ── */
+      /* drag-to-measure: Plotly fires plotly_relayout with selections data
+         in one of three formats depending on Plotly.js version:
+           A) ed.selections = [{x0, x1, ...}]          (array)
+           B) ed['selections[0].x0'] = value            (dot-notation keys)
+           C) only _fullLayout is updated, ed is partial */
       src.on('plotly_relayout',function(ed){
         if(selfRelayout.has(src)) return;
-        var isSel=Object.keys(ed).some(function(k){
-          return k==='selections'||k.startsWith('selections[');
-        });
-        if(!isSel) return;
+        var keys=Object.keys(ed);
+        var hasSel=keys.some(function(k){return k==='selections'||k.startsWith('selections[');});
+        if(!hasSel) return;
+
         var x0,x1;
+        /* Format A */
         if(Array.isArray(ed.selections)&&ed.selections.length){
           x0=ed.selections[0].x0; x1=ed.selections[0].x1;
-        } else {
-          var sels=src.layout&&src.layout.selections;
-          if(sels&&sels.length){ x0=sels[0].x0; x1=sels[0].x1; }
         }
+        /* Format B */
+        else if(ed['selections[0].x0']!==undefined){
+          x0=ed['selections[0].x0']; x1=ed['selections[0].x1'];
+        }
+        /* Format C: read from _fullLayout */
+        else{
+          var fl=(src._fullLayout||src.layout||{});
+          if(fl.selections&&fl.selections.length){x0=fl.selections[0].x0;x1=fl.selections[0].x1;}
+        }
+
         if(x0===undefined||x1===undefined){
           hideTip(src); shapeRelayout(P,src,origShapes.get(src)||[]); return;
         }
