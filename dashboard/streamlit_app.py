@@ -344,7 +344,7 @@ with col_idx:
     index_key = st.selectbox("vs. Index", list(INDEX_MAP.keys()), key="index_sel",
                               format_func=_fmt_idx)
 with col_per:
-    period = st.selectbox("Period", ["1y", "2y", "3y", "5y", "Custom"], index=2)
+    period = st.selectbox("Period", ["YTD", "1y", "2y", "3y", "5y", "Custom"], index=3)
 with col_btn:
     st.button("Load", use_container_width=True, type="primary")
 with col_copy:
@@ -394,9 +394,13 @@ async function run(){
 </script>
 """, height=38)
 
-# ── Custom date pickers ───────────────────────────────────────────────────────
+# ── Custom / YTD date pickers ─────────────────────────────────────────────────
 custom_start = custom_end = None
-if period == "Custom":
+if period == "YTD":
+    import datetime as _dt
+    custom_start = _dt.date((_dt.date.today()).year, 1, 1)
+    custom_end   = _dt.date.today()
+elif period == "Custom":
     import datetime as _dt
     cd1, cd2, _ = st.columns([1.5, 1.5, 7])
     with cd1:
@@ -539,6 +543,7 @@ if ticker:
             hoverlabel=dict(bgcolor=BG, bordercolor=GRID,
                             font=dict(color=TEXT, size=11, family="Inter, sans-serif")),
             showlegend=False,
+            dragmode=False,
         )
 
     dates = df_plot["date"]
