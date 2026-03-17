@@ -30,6 +30,7 @@ INDEX_MAP = {
     "HSI":   "^HSI",     # Hang Seng
     "KOSPI": "^KS11",    # Korea KOSPI
     "ASX200":"^AXJO",    # Australia ASX 200
+    "MSCI":  "MSCI",     # MSCI Inc. (stock)
 }
 
 # Bloomberg exchange suffix → (yfinance suffix, home index key)
