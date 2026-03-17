@@ -13,6 +13,8 @@ Changes in this version:
   - Drag on any chart measures change (price $±% or pp) instead of zooming
   - Snap-to-point drag: snaps to nearest data points, draws dashed vertical
     lines, shows centered tooltip with delta + date range (Google Finance style)
+  - Copy button now includes header metrics strip (company name, ticker/dates,
+    price/beta/perf cards) above the 4 charts
 """
 
 import sys, os
@@ -365,16 +367,78 @@ async function run(){
   btn.disabled=true; btn.textContent='…';
   try{
     const P=window.parent.Plotly;
-    const all=[...window.parent.document.querySelectorAll('.js-plotly-plot')];
+    const doc=window.parent.document;
+    const all=[...doc.querySelectorAll('.js-plotly-plot')];
     if(all.length<4){btn.disabled=false;btn.textContent='Copy';return;}
     const cw=780,ch=445,sc=1.5,pad=8;
     const rw=Math.round(cw*sc),rh=Math.round(ch*sc),rp=Math.round(pad*sc);
     const imgs=await Promise.all(all.slice(0,4).map(d=>P.toImage(d,{format:'png',width:cw,height:ch,scale:sc})));
-    const slots=[[imgs[0],rp,rp],[imgs[2],rw+rp*2,rp],[imgs[1],rp,rh+rp*2],[imgs[3],rw+rp*2,rh+rp*2]];
+
+    // ── Read header data from DOM ──────────────────────────────────────────────
+    const nameText = (doc.querySelector('.company-name')||{}).innerText||'';
+    const subText  = (doc.querySelector('.ticker-sub')||{}).innerText||'';
+    const cards    = [...doc.querySelectorAll('.color-metric')];
+
+    // ── Header geometry ────────────────────────────────────────────────────────
+    const hPad   = Math.round(14*sc);
+    const nameFs = Math.round(16*sc);
+    const subFs  = Math.round(11*sc);
+    const cardH  = Math.round(64*sc);
+    const gap    = Math.round(6*sc);
+    const headerH= hPad + nameFs + gap + subFs + gap*2 + cardH + hPad;
+
+    const totalW = rw*2+rp*3;
     const cv=document.createElement('canvas');
-    cv.width=rw*2+rp*3; cv.height=rh*2+rp*3;
+    cv.width=totalW; cv.height=headerH+rp+rh*2+rp*3;
     const ctx=cv.getContext('2d');
     ctx.fillStyle='#f1f5f9'; ctx.fillRect(0,0,cv.width,cv.height);
+
+    // ── Draw company name ──────────────────────────────────────────────────────
+    let y=hPad+nameFs;
+    ctx.fillStyle='#0f172a';
+    ctx.font=`700 ${nameFs}px Inter,-apple-system,sans-serif`;
+    ctx.fillText(nameText, hPad, y);
+
+    // ── Draw ticker / date sub-line ────────────────────────────────────────────
+    y+=gap+subFs;
+    ctx.fillStyle='#94a3b8';
+    ctx.font=`400 ${subFs}px Inter,-apple-system,sans-serif`;
+    ctx.fillText(subText, hPad, y);
+
+    // ── Draw metric cards ──────────────────────────────────────────────────────
+    if(cards.length){
+      const cardGap = Math.round(8*sc);
+      const cardW   = Math.round((totalW - hPad*2 - cardGap*(cards.length-1)) / cards.length);
+      const cardY   = y + gap*2;
+      const labelFs = Math.round(9*sc);
+      const valFs   = Math.round(17*sc);
+      const r6      = Math.round(6*sc);
+      cards.forEach((card,i)=>{
+        const lbl = (card.querySelector('.cm-label')||{}).innerText||'';
+        const valEl= card.querySelector('.cm-value');
+        const val  = valEl ? valEl.innerText||'' : '';
+        const col  = valEl ? (valEl.style.color||'#0f172a') : '#0f172a';
+        const cx   = hPad + i*(cardW+cardGap);
+        // card background + border
+        ctx.fillStyle='#ffffff'; ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=Math.round(1*sc);
+        ctx.beginPath();
+        if(ctx.roundRect) ctx.roundRect(cx,cardY,cardW,cardH,r6);
+        else ctx.rect(cx,cardY,cardW,cardH);
+        ctx.fill(); ctx.stroke();
+        // label
+        ctx.fillStyle='#64748b';
+        ctx.font=`600 ${labelFs}px Inter,-apple-system,sans-serif`;
+        ctx.fillText(lbl, cx+Math.round(10*sc), cardY+Math.round(18*sc));
+        // value
+        ctx.fillStyle=col;
+        ctx.font=`700 ${valFs}px Inter,-apple-system,sans-serif`;
+        ctx.fillText(val, cx+Math.round(10*sc), cardY+Math.round(42*sc));
+      });
+    }
+
+    // ── Draw charts below header ───────────────────────────────────────────────
+    const chartOffY=headerH+rp*2;
+    const slots=[[imgs[0],rp,chartOffY],[imgs[2],rw+rp*2,chartOffY],[imgs[1],rp,chartOffY+rh+rp],[imgs[3],rw+rp*2,chartOffY+rh+rp]];
     for(const[src,x,y]of slots){
       const im=new Image(); im.src=src;
       await new Promise(r=>im.onload=r);
